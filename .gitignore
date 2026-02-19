@@ -12,11 +12,10 @@ build/
 venv/
 env/
 
-# Save game files (large, binary/text)
+# Save game files (large — ignore contents, track folder structure via .gitkeep)
 gamestate
 meta
 *.sav
-saves/
 
 # OS
 .DS_Store
