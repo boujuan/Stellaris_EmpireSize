@@ -114,14 +114,53 @@ CIVIC_MODIFIERS = {
     # Example: 'civic_key': {'pops': -0.10}
 }
 
-# --- Governor skill effects (NOT yet parsed by this script) ---
-# Planet governors: species_empire_size_mult = -0.02 per skill level
-# Sector governors: species_empire_size_mult = -0.01 per skill level
-# Source: common/static_modifiers/00_static_modifiers.txt
-# A level-8 planet governor reduces all pops on that planet by -16% empire size.
-# To include this, parse governor skill levels from the leaders= section
-# and weight by pops on each planet. This is the main source of the pops gap.
-# Estimated total effect: -10% to -25% additional empire_size_pops_mult
+# Planet Ascension Tier — reduces pops, districts, AND colony from that planet.
+# Each tier: -5% base, scaled by (1 + planetary_ascension_effect_mult).
+# Source: wiki Designation.md, verified in save (ascension_tier=N at depth 3).
+ASCENSION_TIER_BASE_REDUCTION = 0.05   # per tier
+
+# Sources of planetary_ascension_effect_mult (from traditions)
+ASCENSION_EFFECT_TRADITIONS = {
+    'tr_synchronicity_finish':        0.25,  # Hive gestalt
+    'tr_synchronicity_machine_finish':0.25,  # Machine gestalt swap
+    'tr_harmony_finish':              0.25,  # Regular empires
+    'tr_harmony_federations_finish':  0.25,  # Federations DLC swap
+}
+
+# Sources of planetary_ascension_effect_mult (from civics)
+ASCENSION_EFFECT_CIVICS = {
+    'civic_ascensionists':            0.25,  # Regular
+    'civic_hive_ascensionists':       0.25,  # Hive gestalt
+    'civic_machine_ascensionists':    0.25,  # Machine gestalt
+    'civic_corporate_ascensionists':  0.25,  # Corporate
+}
+
+# Governor skill effects on pops (species_empire_size_mult per skill level)
+# Source: common/static_modifiers/00_static_modifiers.txt lines 1305-1377
+# All governor classes (official, commander, scientist) use the same rates.
+# Planet and sector effects do NOT stack — each planet gets one rate.
+GOVERNOR_PLANET_RATE = -0.02   # Sector capital: direct planet governor
+GOVERNOR_SECTOR_RATE = -0.01   # Other sector planets: sector governor
+
+# Starbase levels that count as systems for empire size.
+# Orbital rings and deep space citadels are excluded.
+# Source: common/starbase_levels/
+SYSTEM_STARBASE_LEVELS = {
+    'starbase_level_outpost',
+    'starbase_level_starport',
+    'starbase_level_starhold',
+    'starbase_level_starfortress',
+    'starbase_level_citadel',
+}
+
+# Governor trait modifiers (per-planet empire size effects)
+# Source: common/traits/00_governor_traits.txt
+GOVERNOR_TRAIT_MODIFIERS = {
+    'leader_trait_urbanist': {
+        'planet': {'districts': -0.50},
+        'sector': {'districts': -0.25},
+    },
+}
 
 # ================================================================
 # END SETTINGS
@@ -271,6 +310,7 @@ def extract_country_data(gamestate_path, country_id):
         'civics': [],
         'owned_planets': [],
         'controlled_planets': [],
+        'owned_fleets': [],
         'empire_size': None,
         'num_sapient_pops': None,
         'name': str(country_id),
@@ -286,6 +326,10 @@ def extract_country_data(gamestate_path, country_id):
     in_tech_status = False
     tech_status_depth = None
     pending_technology = None
+    in_government = False
+    in_civics_block = False
+    in_fleets_manager = False
+    in_owned_fleets = False
 
     for depth, line in stream_lines(gamestate_path):
         # Find country= section
@@ -415,6 +459,34 @@ def extract_country_data(gamestate_path, country_id):
             if m:
                 data['edicts'].append(m.group(1))
 
+        # government= { civics= { ... } } block for civic keys
+        if depth == 2 and re.match(r'^government=', line):
+            in_government = True
+        if in_government and depth == 3 and re.match(r'^civics=', line):
+            in_civics_block = True
+        elif in_civics_block and depth == 4:
+            m = re.match(r'^"([^"]+)"$', line)
+            if m:
+                data['civics'].append(m.group(1))
+        elif in_civics_block and depth <= 3 and line not in ('{', '}'):
+            in_civics_block = False
+        if in_government and depth <= 2 and line not in ('{', '}') and not re.match(r'^government=', line):
+            in_government = False
+
+        # fleets_manager= { owned_fleets= { { fleet=N } ... } }
+        if depth == 2 and re.match(r'^fleets_manager=', line):
+            in_fleets_manager = True
+        elif in_fleets_manager and depth == 3 and re.match(r'^owned_fleets=', line):
+            in_owned_fleets = True
+        elif in_owned_fleets and depth == 5:
+            m = re.match(r'^fleet=(\d+)', line)
+            if m:
+                data['owned_fleets'].append(int(m.group(1)))
+        elif in_owned_fleets and depth <= 3 and line not in ('{', '}'):
+            in_owned_fleets = False
+        if in_fleets_manager and depth <= 2 and line not in ('{', '}') and not re.match(r'^fleets_manager=', line):
+            in_fleets_manager = False
+
     return data
 
 
@@ -423,10 +495,15 @@ def extract_planet_data(gamestate_path, owned_planet_ids):
     For each owned planet, extract:
       - district IDs (from districts={...} array)
       - pops per species (from species_information={N={num_pops=X}})
-    Returns: {planet_id: {'district_ids': [int], 'species_pops': {species_id: int}}}
+      - ascension_tier (int, default 0)
+      - governor leader ID (int or None)
+    Returns: {planet_id: {'district_ids': [int], 'species_pops': {species_id: int},
+              'ascension_tier': int, 'governor': int|None}}
     """
     owned_set = set(owned_planet_ids)
-    planet_data = {pid: {'district_ids': [], 'species_pops': {}} for pid in owned_set}
+    planet_data = {pid: {'district_ids': [], 'species_pops': {},
+                         'ascension_tier': 0, 'governor': None}
+                   for pid in owned_set}
 
     in_planets = False
     current_planet_id = None
@@ -465,6 +542,20 @@ def extract_planet_data(gamestate_path, owned_planet_ids):
             continue
 
         pd = planet_data[current_planet_id]
+
+        # ascension_tier= at depth 3
+        if depth == 3:
+            m = re.match(r'^ascension_tier=(\d+)', line)
+            if m:
+                pd['ascension_tier'] = int(m.group(1))
+                continue
+
+        # governor= at depth 3
+        if depth == 3:
+            m = re.match(r'^governor=(\d+)', line)
+            if m:
+                pd['governor'] = int(m.group(1))
+                continue
 
         # districts= array at depth 3
         if depth == 3 and re.match(r'^districts=', line):
@@ -542,18 +633,19 @@ def extract_district_levels(gamestate_path, district_ids):
     return levels
 
 
-def count_owned_systems(gamestate_path, country_graphical_culture):
+def count_owned_systems(gamestate_path, owned_fleet_ids):
     """
     Count systems owned by this country using the starbase_mgr section.
-    Strategy: each starbase entry has station=N where N is a ship ID.
-    That ship has a graphical_culture matching the owning country.
+    Only counts starbases with levels in SYSTEM_STARBASE_LEVELS (excludes
+    orbital rings, deep space citadels, and other special starbases).
+    Ownership verified via station ship fleet membership.
 
-    NOTE: This counts all starbases including orbital platforms.
-    Orbital platforms add ~5-8% overcounting vs game-reported system count
-    (e.g., 466 counted vs 432 actual). The overcounting is documented in output.
+    Returns: (system_count, total_starbases_matched, excluded_count)
     """
-    # Build ship_id -> graphical_culture from the ships section
-    ship_culture = {}
+    owned_fleets = set(owned_fleet_ids)
+
+    # Build ship_id -> fleet_id from the ships section
+    ship_fleet = {}
     in_ships = False
     ship_id = None
 
@@ -564,19 +656,23 @@ def count_owned_systems(gamestate_path, country_graphical_culture):
             continue
         if depth == 0 and line not in ('{', '}'):
             break
-        if depth == 1:
+        if depth == 1 and line not in ('{', '}'):
             m = re.match(r'^(\d+)=', line)
             if m:
                 ship_id = int(m.group(1))
         if depth == 2 and ship_id is not None:
-            m = re.match(r'^graphical_culture="([^"]+)"', line)
+            m = re.match(r'^fleet=(\d+)', line)
             if m:
-                ship_culture[ship_id] = m.group(1)
+                ship_fleet[ship_id] = int(m.group(1))
 
-    # Count starbases for this culture
-    count = 0
+    # Count starbases whose station ship is in one of our fleets
+    system_count = 0
+    total_matched = 0
+    excluded = 0
     in_sm = False
     sb_id = None
+    sb_level = None
+    sb_station = None
 
     for depth, line in stream_lines(gamestate_path):
         if not in_sm:
@@ -585,18 +681,264 @@ def count_owned_systems(gamestate_path, country_graphical_culture):
             continue
         if depth == 0 and line not in ('{', '}'):
             break
-        if depth == 2:
+        if depth == 2 and line not in ('{', '}'):
             m = re.match(r'^(\d+)=', line)
             if m:
+                # Process previous starbase if complete
+                if sb_station is not None and sb_level is not None:
+                    fleet_id = ship_fleet.get(sb_station)
+                    if fleet_id is not None and fleet_id in owned_fleets:
+                        total_matched += 1
+                        if sb_level in SYSTEM_STARBASE_LEVELS:
+                            system_count += 1
+                        else:
+                            excluded += 1
                 sb_id = int(m.group(1))
+                sb_level = None
+                sb_station = None
         if depth == 3 and sb_id is not None:
+            m = re.match(r'^level="([^"]+)"', line)
+            if m:
+                sb_level = m.group(1)
             m = re.match(r'^station=(\d+)', line)
             if m:
-                ship_n = int(m.group(1))
-                if ship_culture.get(ship_n) == country_graphical_culture:
-                    count += 1
+                sb_station = int(m.group(1))
 
-    return count
+    # Process last starbase
+    if sb_station is not None and sb_level is not None:
+        fleet_id = ship_fleet.get(sb_station)
+        if fleet_id is not None and fleet_id in owned_fleets:
+            total_matched += 1
+            if sb_level in SYSTEM_STARBASE_LEVELS:
+                system_count += 1
+            else:
+                excluded += 1
+
+    return system_count, total_matched, excluded
+
+
+def extract_leader_data(gamestate_path, leader_ids):
+    """
+    Extract skill levels, class, and traits for specified leaders.
+    Pass 6: iterates the leaders= section.
+    Returns: {leader_id: {'skill': int, 'class': str, 'traits': [str]}}
+    """
+    needed = set(leader_ids)
+    if not needed:
+        return {}
+
+    leaders = {}
+    in_leaders = False
+    current_id = None
+    current_data = None
+
+    for depth, line in stream_lines(gamestate_path):
+        if not in_leaders:
+            if depth == 0 and re.match(r'^leaders=', line):
+                in_leaders = True
+            continue
+        if depth == 0 and line not in ('{', '}'):
+            break
+
+        if depth == 1 and line not in ('{', '}'):
+            # New leader ID entry — finalize previous leader if any
+            if current_id is not None and current_data is not None:
+                current_data['skill'] = current_data['_level'] + current_data['_bonus']
+                del current_data['_level']
+                del current_data['_bonus']
+                leaders[current_id] = current_data
+                current_id = None
+                current_data = None
+                if len(leaders) == len(needed):
+                    break
+
+            m = re.match(r'^(\d+)=', line)
+            if m:
+                lid = int(m.group(1))
+                if lid in needed:
+                    current_id = lid
+                    current_data = {'skill': 0, 'class': '', 'traits': [],
+                                    '_level': 0, '_bonus': 0}
+                else:
+                    current_id = None
+            continue
+
+        if depth <= 1:
+            continue
+
+        if current_id is None:
+            continue
+
+        if depth == 2:
+            m = re.match(r'^level=(\d+)', line)
+            if m:
+                current_data['_level'] = int(m.group(1))
+            m = re.match(r'^bonus_skill_level=(\d+)', line)
+            if m:
+                current_data['_bonus'] = int(m.group(1))
+            m = re.match(r'^class="([^"]+)"', line)
+            if m:
+                current_data['class'] = m.group(1)
+            m = re.match(r'^traits="([^"]+)"', line)
+            if m:
+                current_data['traits'].append(m.group(1))
+
+    # Finalize last leader if stream ended
+    if current_id is not None and current_data is not None:
+        current_data['skill'] = current_data['_level'] + current_data['_bonus']
+        del current_data['_level']
+        del current_data['_bonus']
+        leaders[current_id] = current_data
+
+    return leaders
+
+
+def extract_sector_data(gamestate_path, country_id):
+    """
+    Extract sector information for the specified country.
+    Pass 7: iterates the sectors= section.
+    Returns: {sector_id: {'local_capital': planet_id, 'systems': [int]}}
+    """
+    sectors = {}
+    in_sectors = False
+    current_sector_id = None
+    current_sector = None
+    current_owner = None
+    current_subsection = None
+
+    for depth, line in stream_lines(gamestate_path):
+        if not in_sectors:
+            if depth == 0 and re.match(r'^sectors=', line):
+                in_sectors = True
+            continue
+        if depth == 0 and line not in ('{', '}'):
+            break
+
+        # Sector ID at depth 1
+        if depth == 1:
+            m = re.match(r'^(\d+)=', line)
+            if m:
+                # Save previous sector if it belongs to our country
+                if current_sector is not None and current_owner == country_id:
+                    sectors[current_sector_id] = current_sector
+                current_sector_id = int(m.group(1))
+                current_sector = {'local_capital': None, 'systems': []}
+                current_owner = None
+                current_subsection = None
+            elif line == 'none':
+                current_sector = None
+                current_owner = None
+            continue
+
+        if current_sector is None:
+            continue
+
+        if depth == 2:
+            m = re.match(r'^owner=(\d+)', line)
+            if m:
+                current_owner = int(m.group(1))
+            m = re.match(r'^local_capital=(\d+)', line)
+            if m:
+                current_sector['local_capital'] = int(m.group(1))
+            if re.match(r'^systems=', line):
+                current_subsection = 'systems'
+                continue
+
+        if current_subsection == 'systems' and depth == 3:
+            nums = re.findall(r'\b(\d+)\b', line)
+            current_sector['systems'].extend(int(n) for n in nums)
+        elif current_subsection == 'systems' and depth <= 2 and line not in ('{', '}'):
+            current_subsection = None
+
+    # Save last sector
+    if current_sector is not None and current_owner == country_id:
+        sectors[current_sector_id] = current_sector
+
+    return sectors
+
+
+def build_planet_to_sector_map(gamestate_path, sector_data, planet_data):
+    """
+    Build mapping from planet_id to sector info for governor effects.
+    Pass 8: iterates galactic_object= to map planets → systems → sectors.
+
+    Returns: {planet_id: {
+        'sector_id': int,
+        'is_sector_capital': bool,
+        'sector_governor': int|None  (leader_id from the sector capital)
+    }}
+    """
+    # Build system_id → sector_id mapping from sector_data
+    system_to_sector = {}
+    for sec_id, sec in sector_data.items():
+        for sys_id in sec['systems']:
+            system_to_sector[sys_id] = sec_id
+
+    # Build sector_id → governor (from the capital planet's governor field)
+    sector_governor = {}
+    sector_capitals = set()
+    for sec_id, sec in sector_data.items():
+        cap = sec['local_capital']
+        if cap is not None:
+            sector_capitals.add(cap)
+            if cap in planet_data and planet_data[cap].get('governor') is not None:
+                sector_governor[sec_id] = planet_data[cap]['governor']
+
+    owned_planet_ids = set(planet_data.keys())
+
+    # Parse galactic_object= to find which system each planet belongs to
+    # Format: galactic_object= { 0= { planet=1569 planet=1570 ... } 1= { ... } }
+    planet_to_system = {}
+    in_go = False
+    current_sys_id = None
+
+    for depth, line in stream_lines(gamestate_path):
+        if not in_go:
+            if depth == 0 and re.match(r'^galactic_object=', line):
+                in_go = True
+            continue
+        if depth == 0 and line not in ('{', '}'):
+            break
+
+        # System ID at depth 1
+        if depth == 1 and line not in ('{', '}'):
+            m = re.match(r'^(\d+)=', line)
+            if m:
+                current_sys_id = int(m.group(1))
+            continue
+
+        if current_sys_id is None:
+            continue
+
+        # Only process systems that are in our sectors
+        if current_sys_id not in system_to_sector:
+            continue
+
+        # planet=<id> at depth 2 (individual entries, not a sub-block)
+        if depth == 2:
+            m = re.match(r'^planet=(\d+)', line)
+            if m:
+                pid = int(m.group(1))
+                if pid in owned_planet_ids:
+                    planet_to_system[pid] = current_sys_id
+
+    # Build final mapping
+    result = {}
+    for pid in owned_planet_ids:
+        sys_id = planet_to_system.get(pid)
+        if sys_id is None:
+            # Planet not found in any of our sectors' systems
+            continue
+        sec_id = system_to_sector.get(sys_id)
+        if sec_id is None:
+            continue
+        result[pid] = {
+            'sector_id': sec_id,
+            'is_sector_capital': pid in sector_capitals,
+            'sector_governor': sector_governor.get(sec_id),
+        }
+
+    return result
 
 
 # ================================================================
@@ -615,6 +957,8 @@ def calculate_active_modifiers(country_data, species_data, pop_species):
         'total': float,      # empire_size_mult (global)
         'sources': {type: [(source_name, value), ...]}
         'species_mults': {species_id: float}  # per-species mult
+        'ascension_effect_mult': float  # planetary_ascension_effect_mult
+        'ascension_effect_sources': [(source_name, value), ...]
     }
     """
     mods = {'pops': 0.0, 'districts': 0.0, 'systems': 0.0, 'colonies': 0.0, 'total': 0.0}
@@ -646,6 +990,11 @@ def calculate_active_modifiers(country_data, species_data, pop_species):
         if edict in EDICT_MODIFIERS:
             add(EDICT_MODIFIERS[edict], f"edict: {edict}")
 
+    # Civics
+    for civic in country_data['civics']:
+        if civic in CIVIC_MODIFIERS:
+            add(CIVIC_MODIFIERS[civic], f"civic: {civic}")
+
     # Per-species species_empire_size_mult
     species_mults = {}
     for sp_id in pop_species:
@@ -660,7 +1009,23 @@ def calculate_active_modifiers(country_data, species_data, pop_species):
             mult += EVOPRED_PER_TRAIT_MULT * evopred
         species_mults[sp_id] = mult
 
-    return {**mods, 'sources': sources, 'species_mults': species_mults}
+    # Planetary ascension effect mult (from traditions + civics)
+    asc_effect = 0.0
+    asc_effect_sources = []
+    for trad in country_data['traditions']:
+        if trad in ASCENSION_EFFECT_TRADITIONS:
+            val = ASCENSION_EFFECT_TRADITIONS[trad]
+            asc_effect += val
+            asc_effect_sources.append((f"tradition: {trad}", val))
+    for civic in country_data['civics']:
+        if civic in ASCENSION_EFFECT_CIVICS:
+            val = ASCENSION_EFFECT_CIVICS[civic]
+            asc_effect += val
+            asc_effect_sources.append((f"civic: {civic}", val))
+
+    return {**mods, 'sources': sources, 'species_mults': species_mults,
+            'ascension_effect_mult': asc_effect,
+            'ascension_effect_sources': asc_effect_sources}
 
 
 # ================================================================
@@ -668,70 +1033,172 @@ def calculate_active_modifiers(country_data, species_data, pop_species):
 # ================================================================
 
 def calculate_breakdown(
-    total_pops_by_species,  # {species_id: pop_count}
-    total_district_levels,  # int (sum of all owned district levels)
+    planet_data,            # {pid: {'district_ids', 'species_pops', 'ascension_tier', 'governor'}}
+    district_levels,        # {district_id: level}
     total_systems,          # int
-    total_colonies,         # int (owned_planets count)
     modifiers,              # from calculate_active_modifiers
-    species_data            # for display labels
+    species_data,           # for display labels
+    leader_data,            # {leader_id: {'skill', 'class', 'traits'}}
+    planet_sector_map,      # {pid: {'sector_id', 'is_sector_capital', 'sector_governor'}}
 ):
     """
-    Calculate empire size breakdown by component.
-    Formula:
-      pops_raw     = Σ (pops_of_species * BASE_pops * (1 + species_empire_size_mult))
-      pops_comp    = pops_raw * (1 + empire_size_pops_mult)
-      dist_comp    = total_districts * BASE_dist * (1 + empire_size_districts_mult)
-      sys_comp     = total_systems  * BASE_sys  * (1 + empire_size_systems_mult)
-      col_comp     = total_colonies * BASE_col  * (1 + empire_size_colonies_mult)
-      subtotal     = pops_comp + dist_comp + sys_comp + col_comp
-      empire_size  = subtotal * (1 + empire_size_mult)
-    Returns detailed breakdown dict.
+    Calculate empire size breakdown by component with per-planet modifiers.
+
+    Per-planet:
+      ascension_factor = 1 - tier × BASE_REDUCTION × (1 + ascension_effect_mult)
+      governor_pop_mult = GOVERNOR_RATE × skill_level  (pops only)
+      planet_pops = Σ(pops × BASE_pops × (1 + species_mult + governor_pop_mult)) × asc_factor
+      planet_districts = Σ(district_levels) × BASE_dist × asc_factor
+      planet_colony = 1 × BASE_col × asc_factor
+
+    Country-wide (after summing all planets):
+      pops_component = sum(planet_pops) × (1 + empire_size_pops_mult)
+      districts_component = sum(planet_districts) × (1 + empire_size_districts_mult)
+      colonies_component = sum(planet_colony) × (1 + empire_size_colonies_mult)
+      systems_component = total_systems × BASE_sys × (1 + empire_size_systems_mult)
     """
     sm = modifiers['species_mults']
+    asc_effect_mult = modifiers['ascension_effect_mult']
 
-    # Pop contributions by species
-    pops_detail = {}
-    pops_raw = 0.0
-    for sp_id, count in total_pops_by_species.items():
-        sp_mult = sm.get(sp_id, 0.0)
-        contribution = count * BASE['pops'] * (1.0 + sp_mult)
-        pops_detail[sp_id] = {
-            'count': count,
-            'species_mult': sp_mult,
-            'raw_contribution': contribution,
+    # Per-planet calculation
+    total_pops_raw_no_planet_mods = 0.0   # raw pops before governor + ascension (for reporting)
+    total_pops_after_planet = 0.0         # pops after governor + ascension
+    total_districts_after_planet = 0.0
+    total_colonies_after_planet = 0.0
+    total_pops_by_species = defaultdict(float)
+
+    # Per-species reporting (country-wide, without governor/ascension)
+    pops_detail = defaultdict(lambda: {'count': 0, 'species_mult': 0.0, 'raw_contribution': 0.0})
+
+    # Governor and ascension summaries for reporting
+    governor_summary = {'planets_with_governor': 0, 'total_pops_reduction': 0.0}
+    ascension_summary = defaultdict(int)  # tier → count of planets
+
+    planet_details = {}  # per-planet details for report
+
+    for pid, pd in planet_data.items():
+        # Ascension tier
+        tier = pd['ascension_tier']
+        ascension_summary[tier] += 1
+        asc_factor = 1.0 - tier * ASCENSION_TIER_BASE_REDUCTION * (1.0 + asc_effect_mult)
+        asc_factor = max(0.0, asc_factor)
+
+        # Governor pops modifier
+        gov_id = pd.get('governor')
+        sec_info = planet_sector_map.get(pid, {})
+        gov_pop_mult = 0.0
+        gov_skill = 0
+        gov_type = None
+
+        if gov_id is not None and gov_id in leader_data:
+            # Planet has a direct governor (this is a sector capital)
+            gov_skill = leader_data[gov_id]['skill']
+            gov_pop_mult = GOVERNOR_PLANET_RATE * gov_skill
+            gov_type = 'planet'
+            governor_summary['planets_with_governor'] += 1
+        elif sec_info.get('sector_governor') is not None:
+            sec_gov_id = sec_info['sector_governor']
+            if sec_gov_id in leader_data:
+                gov_skill = leader_data[sec_gov_id]['skill']
+                gov_pop_mult = GOVERNOR_SECTOR_RATE * gov_skill
+                gov_type = 'sector'
+                governor_summary['planets_with_governor'] += 1
+
+        # Per-planet pops (with governor + ascension)
+        planet_pops_raw = 0.0
+        planet_pops_no_gov = 0.0
+        planet_total_pop_count = 0
+        for sp_id, pop_count in pd['species_pops'].items():
+            sp_mult = sm.get(sp_id, 0.0)
+            # Raw contribution (no governor, no ascension) for species reporting
+            raw = pop_count * BASE['pops'] * (1.0 + sp_mult)
+            pops_detail[sp_id]['count'] += pop_count
+            pops_detail[sp_id]['species_mult'] = sp_mult
+            pops_detail[sp_id]['raw_contribution'] += raw
+            total_pops_by_species[sp_id] += pop_count
+
+            # With governor
+            with_gov = pop_count * BASE['pops'] * (1.0 + sp_mult + gov_pop_mult)
+            planet_pops_raw += with_gov
+            planet_pops_no_gov += raw
+            planet_total_pop_count += pop_count
+
+        planet_pops_after_asc = planet_pops_raw * asc_factor
+        total_pops_raw_no_planet_mods += planet_pops_no_gov
+        total_pops_after_planet += planet_pops_after_asc
+
+        governor_summary['total_pops_reduction'] += (planet_pops_no_gov - planet_pops_raw)
+
+        # Per-planet districts (with ascension)
+        planet_district_levels = sum(
+            district_levels.get(did, 0) for did in pd['district_ids'])
+        planet_districts_raw = planet_district_levels * BASE['districts']
+        planet_districts_after_asc = planet_districts_raw * asc_factor
+        total_districts_after_planet += planet_districts_after_asc
+
+        # Per-planet colony (with ascension)
+        planet_colony_raw = BASE['colonies']
+        planet_colony_after_asc = planet_colony_raw * asc_factor
+        total_colonies_after_planet += planet_colony_after_asc
+
+        planet_details[pid] = {
+            'pops': planet_total_pop_count,
+            'districts': planet_district_levels,
+            'ascension_tier': tier,
+            'asc_factor': asc_factor,
+            'gov_type': gov_type,
+            'gov_skill': gov_skill,
+            'gov_pop_mult': gov_pop_mult,
+            'pops_contribution': planet_pops_after_asc,
+            'districts_contribution': planet_districts_after_asc,
+            'colony_contribution': planet_colony_after_asc,
         }
-        pops_raw += contribution
 
+    # Country-wide multipliers
     pops_mult = modifiers['pops']
-    pops_component = pops_raw * (1.0 + pops_mult)
+    pops_component = total_pops_after_planet * (1.0 + pops_mult)
 
     districts_mult = modifiers['districts']
-    districts_component = total_district_levels * BASE['districts'] * (1.0 + districts_mult)
+    total_district_levels_sum = sum(
+        sum(district_levels.get(did, 0) for did in pd['district_ids'])
+        for pd in planet_data.values())
+    districts_component = total_districts_after_planet * (1.0 + districts_mult)
 
     systems_mult = modifiers['systems']
     systems_component = total_systems * BASE['systems'] * (1.0 + systems_mult)
 
     colonies_mult = modifiers['colonies']
-    colonies_component = total_colonies * BASE['colonies'] * (1.0 + colonies_mult)
+    colonies_component = total_colonies_after_planet * (1.0 + colonies_mult)
 
     subtotal = pops_component + districts_component + systems_component + colonies_component
     total_mult = modifiers['total']
     empire_size = subtotal * (1.0 + total_mult)
 
     return {
-        'pops_raw': pops_raw,
+        'pops_raw': total_pops_raw_no_planet_mods,
+        'pops_after_planet_mods': total_pops_after_planet,
         'pops_component': pops_component,
-        'pops_detail': pops_detail,
+        'pops_detail': dict(pops_detail),
         'pops_mult': pops_mult,
+        'districts_raw': total_district_levels_sum * BASE['districts'],
+        'districts_after_planet_mods': total_districts_after_planet,
         'districts_component': districts_component,
         'districts_mult': districts_mult,
         'systems_component': systems_component,
         'systems_mult': systems_mult,
+        'colonies_raw': len(planet_data) * BASE['colonies'],
+        'colonies_after_planet_mods': total_colonies_after_planet,
         'colonies_component': colonies_component,
         'colonies_mult': colonies_mult,
         'subtotal': subtotal,
         'total_mult': total_mult,
         'empire_size': empire_size,
+        'governor_summary': governor_summary,
+        'ascension_summary': dict(ascension_summary),
+        'ascension_effect_mult': asc_effect_mult,
+        'planet_details': planet_details,
+        'total_pops_by_species': dict(total_pops_by_species),
+        'total_district_levels': total_district_levels_sum,
     }
 
 
@@ -740,8 +1207,8 @@ def calculate_breakdown(
 # ================================================================
 
 def print_report(breakdown, country_data, modifiers, species_data,
-                 total_districts, total_systems, game_reported=None,
-                 orbital_note=False):
+                 total_systems, systems_total_matched, systems_excluded,
+                 game_reported=None):
     """Print formatted empire size breakdown report."""
     W = 65
     SEP = '═' * W
@@ -765,6 +1232,30 @@ def print_report(breakdown, country_data, modifiers, species_data,
     print(SEP)
     print()
 
+    # ── PLANET MODIFIERS SUMMARY ──
+    asc = breakdown['ascension_summary']
+    if any(t > 0 for t in asc):
+        print("PLANET ASCENSION TIERS:")
+        asc_eff = breakdown['ascension_effect_mult']
+        for tier in sorted(asc.keys()):
+            if tier == 0:
+                continue
+            reduction = tier * ASCENSION_TIER_BASE_REDUCTION * (1.0 + asc_eff)
+            print(f"    Tier {tier}: {asc[tier]} planets  "
+                  f"(−{reduction*100:.1f}% to pops/districts/colony)")
+        if asc.get(0, 0) > 0:
+            print(f"    Tier 0: {asc[0]} planets  (no reduction)")
+        print(f"  planetary_ascension_effect_mult = {pct(asc_eff)}:")
+        print(fmt_sources(modifiers['ascension_effect_sources']))
+        print()
+
+    gov = breakdown['governor_summary']
+    if gov['planets_with_governor'] > 0:
+        print("GOVERNOR EFFECTS:")
+        print(f"    {gov['planets_with_governor']} planets with governor coverage")
+        print(f"    Total pops reduction from governors: {gov['total_pops_reduction']:.2f}")
+        print()
+
     # ── POPULATIONS ──
     total_pops = sum(d['count'] for d in breakdown['pops_detail'].values())
     print(f"POPULATIONS  [{total_pops:,} pops]")
@@ -781,38 +1272,49 @@ def print_report(breakdown, country_data, modifiers, species_data,
         print(f"    species {sp_id}: {det['count']:>8,} pops  "
               f"mult={pct(det['species_mult'])}  "
               f"raw={det['raw_contribution']:7.2f}{traits_note}")
-    print(f"  Raw pops subtotal (after per-species mults): {breakdown['pops_raw']:.2f}")
+    print(f"  Raw pops (species mults only):          {breakdown['pops_raw']:.2f}")
+    print(f"  After governor + ascension:             {breakdown['pops_after_planet_mods']:.2f}")
     print()
     print(f"  empire_size_pops_mult = {pct(breakdown['pops_mult'])}:")
     print(fmt_sources(modifiers['sources']['pops']))
-    print(f"  POPS COMPONENT: {breakdown['pops_raw']:.2f} × (1 {pct(breakdown['pops_mult'])}) "
-          f"= {breakdown['pops_component']:.2f}")
+    print(f"  POPS COMPONENT: {breakdown['pops_after_planet_mods']:.2f}"
+          f" × (1 {pct(breakdown['pops_mult'])})"
+          f" = {breakdown['pops_component']:.1f}")
     print()
 
     # ── DISTRICTS ──
-    print(f"DISTRICTS  [{total_districts} total district levels across all owned planets]")
-    print(f"  Base:  {total_districts} × {BASE['districts']} = {total_districts * BASE['districts']:.1f}")
+    total_dl = breakdown['total_district_levels']
+    print(f"DISTRICTS  [{total_dl} total district levels across all owned planets]")
+    print(f"  Base:  {total_dl} × {BASE['districts']} = {breakdown['districts_raw']:.1f}")
+    print(f"  After ascension:                        {breakdown['districts_after_planet_mods']:.1f}")
     print(f"  empire_size_districts_mult = {pct(breakdown['districts_mult'])}:")
     print(fmt_sources(modifiers['sources']['districts']))
-    print(f"  DISTRICTS COMPONENT: {breakdown['districts_component']:.2f}")
+    print(f"  DISTRICTS COMPONENT: {breakdown['districts_after_planet_mods']:.1f}"
+          f" × (1 {pct(breakdown['districts_mult'])})"
+          f" = {breakdown['districts_component']:.1f}")
     print()
 
     # ── SYSTEMS ──
-    orbital_caveat = " (incl. orbital platforms — may overcount by ~5-8%)" if total_systems > 0 else ""
-    print(f"SYSTEMS  [{total_systems} starbase entries{orbital_caveat}]")
+    print(f"SYSTEMS  [{total_systems} owned systems]")
+    if systems_excluded > 0:
+        print(f"  Starbases matched by fleet: {systems_total_matched}  "
+              f"(excluded {systems_excluded} orbital rings/DSCs)")
     print(f"  Base:  {total_systems} × {BASE['systems']} = {float(total_systems):.1f}")
     print(f"  empire_size_systems_mult = {pct(breakdown['systems_mult'])}:")
     print(fmt_sources(modifiers['sources']['systems']))
-    print(f"  SYSTEMS COMPONENT: {breakdown['systems_component']:.2f}")
+    print(f"  SYSTEMS COMPONENT: {breakdown['systems_component']:.1f}")
     print()
 
     # ── COLONIES ──
     n_col = len(country_data['owned_planets'])
     print(f"COLONIES  [{n_col} owned planets]")
-    print(f"  Base:  {n_col} × {BASE['colonies']} = {n_col * BASE['colonies']:.1f}")
+    print(f"  Base:  {n_col} × {BASE['colonies']} = {breakdown['colonies_raw']:.1f}")
+    print(f"  After ascension:                        {breakdown['colonies_after_planet_mods']:.1f}")
     print(f"  empire_size_colonies_mult = {pct(breakdown['colonies_mult'])}:")
     print(fmt_sources(modifiers['sources']['colonies']))
-    print(f"  COLONIES COMPONENT: {breakdown['colonies_component']:.2f}")
+    print(f"  COLONIES COMPONENT: {breakdown['colonies_after_planet_mods']:.1f}"
+          f" × (1 {pct(breakdown['colonies_mult'])})"
+          f" = {breakdown['colonies_component']:.1f}")
     print()
 
     # ── GLOBAL MULT ──
@@ -831,34 +1333,16 @@ def print_report(breakdown, country_data, modifiers, species_data,
         print(f"  DISCREPANCY:                    {diff:+.2f}  ({diff/game*100:+.1f}%)")
         if abs(diff) > 2:
             print()
-            print("  ⚠  Per-component gap analysis (calc vs game tooltip):")
-            gm = 1.0 + breakdown['total_mult']  # global multiplier factor
-            # Report each component's contribution to the discrepancy
-            gaps = {
-                'Pops':      breakdown['pops_component'],
-                'Districts': breakdown['districts_component'],
-                'Systems':   breakdown['systems_component'],
-                'Colonies':  breakdown['colonies_component'],
-            }
-            hints = {
-                'Pops':      "governor species_empire_size_mult (-2%/lvl planet, -1%/lvl sector)",
-                'Districts': "unknown source — check edicts, building effects",
-                'Systems':   "orbital platforms overcounting — subtract ~34 for this empire",
-                'Colonies':  "unknown source — check edicts or additional perk effects",
-            }
-            total_gap = 0
-            for comp, calc_val in gaps.items():
-                gap_contribution = calc_val * gm - 0  # just show calc value
-                total_gap += calc_val
-            # Show raw component gaps in subtotal units
-            print(f"     {'Component':<12} {'Calculated':>12} {'→ Hint if gap exists'}")
-            print(f"     {'-'*60}")
-            for comp, calc_val in gaps.items():
-                hint = hints[comp]
-                print(f"     {comp:<12} {calc_val:>10.1f}   ({hint})")
-            print()
-            print(f"     → Add missing modifiers to SETTINGS section to close gaps")
-            print(f"     → Governor effects require parsing planet governor skill levels")
+            print("  Per-component comparison:")
+            print(f"     {'Component':<12} {'Calculated':>12}")
+            print(f"     {'-'*30}")
+            for comp, calc_val in [
+                ('Pops', breakdown['pops_component']),
+                ('Districts', breakdown['districts_component']),
+                ('Systems', breakdown['systems_component']),
+                ('Colonies', breakdown['colonies_component']),
+            ]:
+                print(f"     {comp:<12} {calc_val:>10.1f}")
     print()
 
     # ── GROWING PAINS ──
@@ -892,32 +1376,40 @@ def main():
         print(f"Error: {gamestate} not found")
         sys.exit(1)
 
+    gs = str(gamestate)
     print(f"Parsing: {gamestate}  (country {country_id})")
-    print("Pass 1/5: species data ...")
-    species_data = extract_species_data(str(gamestate))
+
+    print("Pass 1/8: species data ...")
+    species_data = extract_species_data(gs)
     print(f"  → {len(species_data)} species loaded")
 
-    print("Pass 2/5: country data ...")
-    country_data = extract_country_data(str(gamestate), country_id)
+    print("Pass 2/8: country data ...")
+    country_data = extract_country_data(gs, country_id)
     print(f"  → {len(country_data['traditions'])} traditions, "
           f"{len(country_data['technologies'])} techs, "
           f"{len(country_data['ascension_perks'])} perks, "
+          f"{len(country_data['civics'])} civics, "
           f"{len(country_data['owned_planets'])} owned planets")
 
-    print("Pass 3/5: planet data ...")
-    planet_data = extract_planet_data(str(gamestate), country_data['owned_planets'])
+    print("Pass 3/8: planet data ...")
+    planet_data = extract_planet_data(gs, country_data['owned_planets'])
     all_district_ids = []
     total_pops_by_species = defaultdict(float)
     for pid, pd in planet_data.items():
         all_district_ids.extend(pd['district_ids'])
         for sp_id, npops in pd['species_pops'].items():
             total_pops_by_species[sp_id] += npops
-    print(f"  → {len(all_district_ids)} district references, "
-          f"{sum(total_pops_by_species.values()):.0f} pops across "
-          f"{len(total_pops_by_species)} species")
+    # Summarize ascension tiers
+    asc_counts = defaultdict(int)
+    for pd in planet_data.values():
+        asc_counts[pd['ascension_tier']] += 1
+    asc_note = ', '.join(f"T{t}:{c}" for t, c in sorted(asc_counts.items()) if t > 0)
+    print(f"  → {len(all_district_ids)} district refs, "
+          f"{sum(total_pops_by_species.values()):.0f} pops, "
+          f"ascension: {asc_note or 'none'}")
 
-    print("Pass 4/5: district levels ...")
-    district_levels = extract_district_levels(str(gamestate), all_district_ids)
+    print("Pass 4/8: district levels ...")
+    district_levels = extract_district_levels(gs, all_district_ids)
     total_district_levels = sum(district_levels.values())
     missing_districts = len(all_district_ids) - len(district_levels)
     print(f"  → {total_district_levels} total district levels "
@@ -925,27 +1417,58 @@ def main():
     if missing_districts:
         print(f"  ⚠ {missing_districts} district IDs not found in districts= section")
 
-    culture = country_data.get('graphical_culture', 'unknown')
-    print(f"Pass 5/5: owned systems (starbases with culture='{culture}') ...")
-    total_systems = count_owned_systems(str(gamestate), culture)
-    print(f"  → {total_systems} owned systems")
+    owned_fleets = country_data.get('owned_fleets', [])
+    print(f"Pass 5/8: owned systems ({len(owned_fleets)} owned fleets) ...")
+    total_systems, systems_total_matched, systems_excluded = count_owned_systems(gs, owned_fleets)
+    print(f"  → {total_systems} owned systems "
+          f"({systems_total_matched} matched, {systems_excluded} excluded)")
+
+    # Collect all governor leader IDs from planet data
+    governor_ids = set()
+    for pd in planet_data.values():
+        if pd.get('governor') is not None:
+            governor_ids.add(pd['governor'])
+
+    print("Pass 6/8: leader data ...")
+    leader_data = extract_leader_data(gs, governor_ids)
+    print(f"  → {len(leader_data)} leaders loaded "
+          f"(skills: {', '.join(str(ld['skill']) for ld in leader_data.values()) or 'none'})")
+
+    print("Pass 7/8: sector data ...")
+    sector_data = extract_sector_data(gs, country_id)
+    # Collect sector governor IDs (from capital planets' governor field)
+    for sec in sector_data.values():
+        cap = sec['local_capital']
+        if cap is not None and cap in planet_data:
+            gov = planet_data[cap].get('governor')
+            if gov is not None:
+                governor_ids.add(gov)
+    # Re-fetch any newly discovered governors
+    missing_govs = governor_ids - set(leader_data.keys())
+    if missing_govs:
+        extra_leaders = extract_leader_data(gs, missing_govs)
+        leader_data.update(extra_leaders)
+        print(f"  → {len(sector_data)} sectors, +{len(extra_leaders)} sector governors loaded")
+    else:
+        print(f"  → {len(sector_data)} sectors")
+
+    print("Pass 8/8: galactic objects (planet→sector map) ...")
+    planet_sector_map = build_planet_to_sector_map(gs, sector_data, planet_data)
+    mapped = sum(1 for p in planet_data if p in planet_sector_map)
+    print(f"  → {mapped}/{len(planet_data)} planets mapped to sectors")
 
     print()
     modifiers = calculate_active_modifiers(
         country_data, species_data, dict(total_pops_by_species))
 
     breakdown = calculate_breakdown(
-        dict(total_pops_by_species),
-        total_district_levels,
-        total_systems,
-        len(country_data['owned_planets']),
-        modifiers,
-        species_data
+        planet_data, district_levels, total_systems,
+        modifiers, species_data, leader_data, planet_sector_map
     )
 
     print_report(
         breakdown, country_data, modifiers, species_data,
-        total_district_levels, total_systems,
+        total_systems, systems_total_matched, systems_excluded,
         game_reported=country_data.get('empire_size')
     )
 

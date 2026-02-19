@@ -26,24 +26,37 @@ EMPIRE_SIZE_TRADITION_COST_PENALTY = 0.002 # Per empire size above base (for tra
 
 ## 2. The Complete Formula
 
+The formula uses per-planet calculation for ascension tier and governor effects, then applies country-wide multipliers.
+
 ```python
-# Step 1: per-pop contributions (multiplicative with species_empire_size_mult)
-pops_raw = Σ over all pop groups:
-    pop_count × 0.005 × (1 + species_empire_size_mult_for_this_species)
+# Step 1: per-planet contributions
+for each planet:
+    # Ascension tier factor (affects pops, districts, colony — NOT systems)
+    asc_factor = 1 - tier × 0.05 × (1 + planetary_ascension_effect_mult)
 
-# Step 2: country-wide pops multiplier (additive from all sources)
-pops_component = pops_raw × (1 + total_empire_size_pops_mult)
+    # Governor pop modifier (per-skill species_empire_size_mult)
+    #   Planet governor (sector capital): -0.02 × skill
+    #   Sector governor (other planets):  -0.01 × skill
+    gov_pop_mult = governor_rate × governor_skill
 
-# Step 3: district component
-districts_component = total_district_levels × 0.5 × (1 + total_empire_size_districts_mult)
+    # Per-planet pops (species mult + governor applied per pop, then ascension)
+    planet_pops = Σ(pop_count × 0.005 × (1 + species_empire_size_mult + gov_pop_mult)) × asc_factor
 
-# Step 4: systems component
-systems_component = owned_systems × 1.0 × (1 + total_empire_size_systems_mult)
+    # Per-planet districts (ascension only)
+    planet_districts = total_district_levels × 0.5 × asc_factor
 
-# Step 5: colonies component
-colonies_component = owned_colonies × 20.0 × (1 + total_empire_size_colonies_mult)
+    # Per-planet colony (ascension only)
+    planet_colony = 1 × 20.0 × asc_factor
 
-# Step 6: global multiplier (applied to sum of all components)
+# Step 2: country-wide multipliers (applied to sums of all planets)
+pops_component      = Σ(planet_pops)      × (1 + total_empire_size_pops_mult)
+districts_component = Σ(planet_districts)  × (1 + total_empire_size_districts_mult)
+colonies_component  = Σ(planet_colony)     × (1 + total_empire_size_colonies_mult)
+
+# Step 3: systems (no per-planet ascension/governor — country-wide only)
+systems_component   = owned_systems × 1.0 × (1 + total_empire_size_systems_mult)
+
+# Step 4: global multiplier (applied to sum of all components)
 subtotal = pops_component + districts_component + systems_component + colonies_component
 empire_size = subtotal × (1 + total_empire_size_mult)
 ```
@@ -54,6 +67,8 @@ empire_size = subtotal × (1 + total_empire_size_mult)
 - `species_empire_size_mult` is applied PER POP based on that pop's species — it modifies the base contribution of each individual pop.
 - `empire_size_pops_mult` is a COUNTRY-WIDE factor applied to the sum of all raw pop contributions.
 - These are multiplicative with each other (not additive).
+
+**Governor effects** are applied at the same level as `species_empire_size_mult` (per-pop, additive with species mult), then ascension tier is applied multiplicatively on top.
 
 ---
 
@@ -103,13 +118,14 @@ With `negative_empire_size_percent = 0.1` (empire size > 1000), monthly progress
 
 | Modifier key | What it reduces | Effect on empire size number |
 |---|---|---|
-| `species_empire_size_mult` | Per-pop contribution (multiplicative, before country mult) | ✅ Reduces raw empire size from pops |
-| `empire_size_pops_mult` | Total empire size from pops (country-wide) | ✅ Reduces empire size |
-| `empire_size_districts_mult` | Total empire size from districts | ✅ Reduces empire size |
-| `empire_size_systems_mult` | Total empire size from systems | ✅ Reduces empire size |
-| `empire_size_colonies_mult` | Total empire size from colonies | ✅ Reduces empire size |
-| `empire_size_mult` | Total empire size (global, applied last) | ✅ Reduces empire size |
-| `empire_size_penalty_mult` | Cost PENALTY from empire size (tech/tradition costs) | ❌ Does NOT reduce empire size number |
+| `species_empire_size_mult` | Per-pop contribution (multiplicative, before country mult) | Reduces raw empire size from pops |
+| `empire_size_pops_mult` | Total empire size from pops (country-wide) | Reduces empire size |
+| `empire_size_districts_mult` | Total empire size from districts | Reduces empire size |
+| `empire_size_systems_mult` | Total empire size from systems | Reduces empire size |
+| `empire_size_colonies_mult` | Total empire size from colonies | Reduces empire size |
+| `empire_size_mult` | Total empire size (global, applied last) | Reduces empire size |
+| `empire_size_penalty_mult` | Cost PENALTY from empire size (tech/tradition costs) | Does NOT reduce empire size number |
+| `planetary_ascension_effect_mult` | Strength of per-tier ascension reduction | Amplifies the -5%/tier planet reduction |
 
 `empire_size_penalty_mult` was the source of confusion in the Chimeral Consciousness authority — it's a separate modifier that only affects how costly empire size is, not the raw empire size value itself.
 
@@ -137,6 +153,15 @@ Source: `common/traditions/*.txt`
 | `tr_virtuality_2` | `pops` | -0.10 | |
 | `tr_virtuality_2` | `colonies` | +1.00 | Note: INCREASES colonies empire size! |
 
+**Ascension effect traditions** (give `planetary_ascension_effect_mult`, NOT empire_size_*_mult):
+
+| Tradition key | Value | Notes |
+|---|---|---|
+| `tr_synchronicity_finish` | +0.25 | Gestalt Synchronicity finisher |
+| `tr_synchronicity_machine_finish` | +0.25 | Machine gestalt swap |
+| `tr_harmony_finish` | +0.25 | Regular Harmony finisher |
+| `tr_harmony_federations_finish` | +0.25 | Federations DLC swap |
+
 ### 5.2 Technologies
 
 Source: `common/technology/00_soc_tech.txt`, `00_first_contact_tech.txt`
@@ -145,8 +170,6 @@ Source: `common/technology/00_soc_tech.txt`, `00_first_contact_tech.txt`
 |---|---|---|---|
 | `tech_psionic_theory` | `pops` | -0.05 | Social tech |
 | `tech_lost_building_methods` | `districts` | -0.30 | First Contact DLC |
-
-**Note:** `tech_psionic_theory` gives `-5% empire_size_pops_mult`. Despite being called "Psionic Theory" (a research tech), it has this empire size effect. The player has it researched — confirmed in `tech_status=` block.
 
 ### 5.3 Ascension Perks
 
@@ -157,30 +180,46 @@ Source: `common/ascension_perks/00_ascension_perks.txt`
 | `ap_imperial_prerogative` | `colonies` | -0.25 | Confirmed 4.3 value. Was -0.50 in earlier versions! |
 | `ap_interstellar_dominion` | `systems` | -0.25 | |
 
-**Country 0's active perks:** `ap_imperial_prerogative`, `ap_enigmatic_engineering`, `ap_engineered_evolution`, `ap_behemoths`, `ap_galactic_force_projection`, `ap_galactic_wonders_utopia_and_megacorp`, `ap_master_builders`
-
-### 5.4 Governor Skill (NOT yet implemented in script)
+### 5.4 Governor Skill
 
 Source: `common/static_modifiers/00_static_modifiers.txt`
 
-```pdx
-skill_official_planet_governor = {
-    species_empire_size_mult = -0.02   # per skill level, PER PLANET
-}
-skill_official_sector_governor = {
-    species_empire_size_mult = -0.01   # per skill level, PER SECTOR
-}
+**Implemented in script.** Applied as per-pop `species_empire_size_mult` on each governed planet.
+
+| Modifier | Rate | Applied when |
+|----------|------|-------------|
+| `skill_X_planet_governor` | `-0.02 × skill` per pop | Planet is the sector capital (direct governor) |
+| `skill_X_sector_governor` | `-0.01 × skill` per pop | Planet is in sector but not capital |
+
+All governor classes (official, commander, scientist) provide this rate. They do NOT stack — each planet gets ONE rate based on its relationship to the governor.
+
+Effective skill = `level + bonus_skill_level` (from `leaders=` section).
+
+**Implementation:** The script builds a planet→system→sector→governor chain across passes 3, 6, 7, and 8 to determine each planet's governor and rate. For the q2 save: 26 of 44 planets have governor coverage, reducing pops by ~94 points.
+
+### 5.5 Planet Ascension Tiers
+
+Source: `common/planet_classes/` (designation modifiers)
+
+**Implemented in script.** Each planet has an `ascension_tier` (0-5). Per tier: `-5%` to pops, districts, AND colony empire size from that planet. No effect on systems.
+
+Modified by `planetary_ascension_effect_mult` (additive from traditions/civics):
+```
+ascension_factor = 1 - tier × 0.05 × (1 + effect_mult)
 ```
 
-This is applied as `species_empire_size_mult` (per-pop), meaning each pop on a governed planet has their empire size contribution reduced by `governor_skill × 0.02`.
+Example: Tier 5 with +0.25 effect_mult = `1 - 5 × 0.05 × 1.25 = 0.6875` → **-31.2%** reduction.
 
-A level-8 planet governor = `-0.16 species_empire_size_mult` for all pops on that planet. With 44 colonized planets and high-level governors, total effect could be `-17%` to `-22%` on pops component.
+**Ascension effect civics** (give `planetary_ascension_effect_mult`):
 
-**This is the largest unresolved source of discrepancy** (+123 points overcount in pops).
+| Civic key | Value |
+|---|---|
+| `civic_ascensionists` | +0.25 |
+| `civic_hive_ascensionists` | +0.25 |
+| `civic_machine_ascensionists` | +0.25 |
+| `civic_corporate_ascensionists` | +0.25 |
 
-To implement: parse `leaders=` section for planet governor leaders, read their skill levels, weight by pops on each governed planet.
-
-### 5.5 Species Traits
+### 5.6 Species Traits
 
 Source: `common/traits/04_species_traits.txt`, `02_species_traits_basic_characteristics.txt`
 
@@ -195,7 +234,7 @@ These give `species_empire_size_mult` at the species level (per pop):
 
 Species 609 (country 0's main species) has none of these — its `species_empire_size_mult` is entirely from the evopred fix mod.
 
-### 5.6 The EvoPred Fix Modifier
+### 5.7 The EvoPred Fix Modifier
 
 Source (our mod): `chimeral_consciousness_fix/common/inline_scripts/pop_categories/social_classes_triggered_modifiers_no_happiness.txt`
 
@@ -217,11 +256,11 @@ triggered_pop_group_modifier = {
 }
 ```
 
-Effect: `species_empire_size_mult = -0.01 × species_traits_evopred_count` applied to all pops whose species has the `species_traits_evopred_count` variable set and whose owner is an EvoPred + Mutation empire.
+Effect: `species_empire_size_mult = -0.01 × species_traits_evopred_count` applied to all pops whose species has the variable set and whose owner is an EvoPred + Mutation empire.
 
 For species 609 with 38 traits: `species_empire_size_mult = -0.38`.
 
-### 5.7 Authority Modifiers
+### 5.8 Authority Modifiers
 
 Country 0's authority (`auth_bio_hive_mind_evopred` advanced swap):
 - `empire_size_penalty_mult = -0.20` — COST PENALTY only, does NOT reduce empire size
@@ -265,6 +304,11 @@ Base `auth_hive_mind` (replaced by the swap via `inherit_effects = no`):
 |--------|-------|
 | tr_statecraft_finish | -5.0% |
 
+### planetary_ascension_effect_mult total: +25%
+| Source | Value |
+|--------|-------|
+| tr_synchronicity_finish | +25.0% |
+
 ### species_empire_size_mult (per species, from mod + traits)
 | Species | Evopred count | Trait mult | Net mult |
 |---------|--------------|-----------|----------|
@@ -274,116 +318,68 @@ Base `auth_hive_mind` (replaced by the swap via `inherit_effects = no`):
 | 16777229 (Cydran, 898 pops) | 6 | 0 | -6.0% |
 | 28 (Thorquell, 652 pops) | 7 | 0 | -7.0% |
 
-The alien pops (species 16777235, 16777233, 16777229, 28) are being purged. They have `species_traits_evopred_count` set because they likely come from another EvoPred empire in the galaxy (the variable was set when their empire processed them). With our fix mod, these also benefit from the reduction.
-
 ---
 
 ## 7. Component Breakdown Verification (q2 save)
 
-### Game tooltip (with fix mod ON):
+### Game tooltip vs script (with fix mod ON):
 
 | Component | Game | Script | Diff | Diff % |
 |-----------|------|--------|------|--------|
-| Pops | 341.1 | 464.1 | +123.0 | +36.1% |
-| Districts | 358.8 | 388.5 | +29.7 | +8.3% |
-| Systems | 367.2 | 396.1 | +28.9 | +7.9% |
-| Colonies | 492.0 | 528.0 | +36.0 | +7.3% |
-| **Subtotal** | **1559.1** | **1776.7** | +217.6 | +13.9% |
-| After ×0.95 | **1481.1** | **1688.0** | +206.9 | +13.9% |
+| Pops | 341.1 | 339.0 | -2.1 | -0.6% |
+| Districts | 358.8 | 358.8 | 0.0 | exact |
+| Systems | 367.2 | 367.2 | 0.0 | exact |
+| Colonies | 492.0 | 492.0 | 0.0 | exact |
+| **Subtotal** | **1559.1** | **1557.0** | -2.1 | -0.1% |
+| After ×0.95 | **1482** | **1479** | -2.8 | -0.2% |
 
-### What game tooltip shows for pops modifiers
+### What resolved each component gap
 
-The game's empire size tooltip (from in-game UI) only shows:
-- Domination Traditions finished: -5%
-- Synchronized Agents: -5%
-- Psionic Theory: -5%
-
-But the calculated pops component (341.1) implies an effective total multiplier of ~-37.5% on raw pops — far more than the -15% visible in the tooltip. The game tooltip likely doesn't show governor effects as they're calculated differently (per-planet, not as country modifiers).
-
-### Mod effect verification
-
-With mod OFF (EVOPRED_PER_TRAIT_MULT = 0.0):
-- pops_raw = 864.995 (all species mult = 0)
-- pops_component = 864.995 × 0.85 = 735.25
-- Game-reported pops component = 575.4
-
-With mod ON:
-- pops_raw = 546.03 (species 609 at -38%, others at their evopred mult)
-- pops_component = 546.03 × 0.85 = 464.12
-- Game-reported pops component = 341.1
-
-Difference in pops_raw: 864.995 - 546.03 = **318.97** (effect of mod on raw pops)
-Difference in pops_component: 735.25 - 464.12 = **271.13** (after -15% pops_mult)
-Difference in final empire size (× 0.95): **257.6**
-
-This confirms the mod works — removing 38% from 96.6% of pops.
+| Component | v0.1 Gap | Fix | v0.2 Gap |
+|-----------|----------|-----|----------|
+| Pops (+123) | Governor effects + ascension tier not applied | Per-planet governor skill mult + ascension factor | -2.1 |
+| Districts (+29.7) | Ascension tier not applied | Per-planet ascension factor | 0.0 |
+| Systems (+28.9) | graphical_culture matched other countries; orbital rings/DSCs counted | Fleet ownership chain + starbase level filtering | 0.0 |
+| Colonies (+36) | Ascension tier not applied | Per-planet ascension factor | 0.0 |
 
 ---
 
-## 8. Unresolved Discrepancies
+## 8. Remaining Discrepancies
 
-### 8.1 Pops: +123 points overcount
+### 8.1 Pops: -2.1 points undercount
 
-**Cause:** Governor `species_empire_size_mult` not implemented.
+The remaining -0.6% gap in pops is small and likely from one or more of:
 
-**Calculation:** The pops_component gap of 123 / 464 = 26.5% overcount. Working backwards:
-- Without mod (game=575.4 vs script=735.25): gap/script = 159.85/735.25 = 21.7%
-- With mod (game=341.1 vs script=464.12): gap/script = 123/464 = 26.5%
+- **Councilor skill effects** — council positions provide per-skill modifiers (e.g., Machine Intelligence ruler: -3%/level pops). Not yet parsed.
+- **Governor traits** — e.g., `leader_trait_urbanist` gives -50% districts on governed planet (partially catalogued in `GOVERNOR_TRAIT_MODIFIERS` but not applied).
+- **Dynamic event modifiers** — biogenesis event chain modifiers (e.g., `optimized_workforce`).
+- **Federation perks** — `ascension_shared_1` gives +0.20 `planetary_ascension_effect_mult`.
+- **Sector governor coverage gap** — 15 of 44 planets unmapped to sectors (likely uncolonized system mapping issues). These planets get no governor reduction, which may slightly overcount rather than undercount.
 
-The governor effect is applied PER POP on each planet, so it interacts multiplicatively with `species_empire_size_mult`. That's why the percentage differs between the two scenarios (governor's absolute contribution is the same but the fraction of the script's output varies).
+### 8.2 Systems: resolved
 
-**To fix:** Parse `leaders=` section, find each planet's governor, apply `-0.02 × skill_level` as `species_empire_size_mult` to all pops on that planet.
+Previously +28.9 overcount. Fixed by:
+1. **Fleet-based ownership** (ship→fleet→owned_fleets chain) instead of graphical_culture matching — eliminated 26 false matches from other countries sharing "biogenesis_01" culture.
+2. **Starbase level filtering** — excluded 8 orbital rings and deep space citadels via `SYSTEM_STARBASE_LEVELS`.
 
-### 8.2 Districts: +29.7 points overcount
+### 8.3 Districts and Colonies: resolved
 
-**Cause:** Unknown source of `-7.64% empire_size_districts_mult`.
-
-Working backwards: 358.8 / (777 × 0.5) = 0.9236 → -7.64% on districts base.
-
-**Possible sources to investigate:**
-- Planet-level building modifiers (some buildings might reduce district empire size contribution)
-- Edicts (country 0 has `crystal_focus`, `fuel_gases`, `motes_kinetic`, `living_metal_construction`, `motes_armor` — check if any affect districts)
-- `tr_domination_imperious_architecture` for Hive Minds activates as `tr_domination_synaptic_extensions` — check its inline script in capital buildings: `common/inline_scripts/buildings/on_all_capital_buildings.txt`
-
-### 8.3 Systems: +28.9 points overcount
-
-**Cause:** Script counts 466 starbases (via ship culture), game shows 432 systems.
-
-Difference: 34 orbital platforms. Each contributes `1.0 × (1 - 0.15) × (1 - 0.05) = 0.807` to empire size.
-34 × 0.807 = 27.4 ≈ 28.9 points.
-
-**To fix:** Identify orbital platforms and exclude them. Hard to do programmatically since orbital IDs in the `orbitals={}` block use entity encoding. Options:
-1. Apply a correction factor (×432/466 ≈ ×0.927)
-2. Cross-reference orbital IDs by scanning all `orbitals={}` blocks and collecting non-null entries
-
-### 8.4 Colonies: +36 points overcount
-
-**Cause:** Unknown source of approximately `-6.82% empire_size_colonies_mult`.
-
-Working backwards: 492 / (44 × 20 × 0.85 × 0.75) = 492/561 = 0.877... but that doesn't work out simply. Actually:
-44 × 20 = 880, script gives 880 × 0.60 = 528 (using -40% = -0.15 - 0.25). Game gives 492. 492/880 = 0.5591. 528/880 = 0.60. So there's another -4.1% additive reduction.
-
-**Possible sources:**
-- `ap_interstellar_dominion` gives `empire_size_systems_mult = -0.25` — already checked, not colonies
-- There might be an edict or building providing additional colony reduction
-- Could be a different value for `ap_imperial_prerogative` (maybe it's actually -0.30 not -0.25 in 4.3?)
+Both resolved by planet ascension tier implementation. The "unknown -7.6% districts source" and "unknown -6.8% colonies source" from v0.1 were both explained by ascension tier reductions on the 10 planets at tier 3-5.
 
 ---
 
 ## 9. What the Chimeral Consciousness Bug Caused
 
 Without the fix mod:
-- pops_component = 735.25 (vs 464.12 with fix)
+- pops_component = 735.25 (vs 339.0 with fix + governors + ascension)
 - systems = same, districts = same, colonies = same
-- Total empire size ≈ 1704
+- Total empire size ~1704
 
 With the fix mod (where we are now):
-- pops_component = 464.12
-- Total empire size ≈ 1482
-
-The -38% reduction on species 609 (96.6% of pops) saves 271 points in pops_component before the global -5% multiplier = 257 points in final empire size.
+- pops_component = 339.0
+- Total empire size ~1479
 
 Despite this improvement:
-- `negative_empire_size_percent` = 0.1 for BOTH 1704 and 1482 (floor at empire_size ≥ 1000)
+- `negative_empire_size_percent` = 0.1 for BOTH 1704 and 1479 (floor at empire_size >= 1000)
 - Growing Pains progress rate is the same (1.965/month) because the floor is at the same value
-- Need empire_size < 1000 for any visible improvement; current gap is ~481 points
+- Need empire_size < 1000 for any visible improvement; current gap is ~479 points

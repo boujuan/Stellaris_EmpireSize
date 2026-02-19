@@ -103,7 +103,7 @@ All sections at depth 0 in `gamestate` (q2 approximate line numbers):
 | `federation=` | 2407121 | small | Federation data |
 | `truce=` | 2407281 | small | |
 | `trade_deal=` | 2407424 | small | |
-| `leaders=` | **2459247** | ~732K lines | All leader data |
+| `leaders=` | **2407429** | ~52K lines | All leader data |
 | `ships=` | **2459386** | ~732K lines | All ship objects |
 | `fleet=` | **3191312** | ~570K lines | All fleet objects |
 | `fleet_template=` | 3760810 | small | |
@@ -114,6 +114,7 @@ All sections at depth 0 in `gamestate` (q2 approximate line numbers):
 | `war=` | 3934464 | small | |
 | `orbital_line=` | 3980594 | small | |
 | `message=` | 3980710 | small | Message objects |
+| `sectors=` | **4494626** | ~9K lines | Sector data |
 | `districts=` | **4503998** | ~96K lines | District objects |
 | `resolution=` | 4515... | small | |
 | `situations=` | **4596154** | small | Situation objects |
@@ -174,12 +175,6 @@ species_db=           ← depth 0
 | `home_planet=N` | Home planet ID |
 | `gender=` | `indeterminable` / `male` / `female` |
 
-### Notes on deprecated subspecies
-
-Country 0 has 75+ species entries. Many are **zero-pop deprecated subspecies** — earlier evolutionary stages with fewer traits and no living pops (these survive as species_db entries but are empty). They can be identified by having a `base_ref=` pointing to the founder (569425345) and having fewer traits. Species 609 is the current founder with 38 traits.
-
-Not all subspecies have `species_traits_evopred_count` set. The deprecated ones often lack it (variable only set when the species gained its traits through gameplay). This is irrelevant since they have 0 pops.
-
 ---
 
 ## 5. Pop Groups (`pop_groups=`)
@@ -187,8 +182,6 @@ Not all subspecies have `species_traits_evopred_count` set. The deprecated ones 
 **Location:** depth 0 at line 64992.
 
 Pop groups are how Stellaris actually stores populations in 4.x (not individual pops). Each pop_group has a `species=N` and a floating-point `size`.
-
-**Note:** The `pop_groups=` entries in planet blocks (depth 3) are just **arrays of IDs** pointing to these global pop_group objects. Example in a planet: `pop_groups={ 419431466 1229 2164263088 }` — these are pop_group IDs, not inline data.
 
 For empire size calculation, it's easier to use `species_information=` in the planet blocks (see §7) which directly gives `num_pops` per species per planet.
 
@@ -198,7 +191,7 @@ For empire size calculation, it's easier to use `species_information=` in the pl
 
 **Location:** depth 0 at line 299792, ends before `starbase_mgr=` at line 370032.
 
-Each galactic object = one star SYSTEM. All 784 entries have `type=star` (confirmed — no other types exist in the galaxy, including black holes and pulsars, which still use `type=star`).
+Each galactic object = one star SYSTEM.
 
 ### Structure
 
@@ -215,25 +208,22 @@ galactic_object=
         ...
         star_class="sc_g"  ← depth 2
         hyperlane= { ... } ← depth 2
+        sector=5           ← depth 2 (sector ID this system belongs to)
     }
 }
 ```
 
 ### Important: No direct owner field
 
-Galactic object entries do NOT have an `owner=country_id` field. System ownership is determined by which country has a starbase there (via `starbase_mgr`).
+Galactic object entries do NOT have an `owner=country_id` field. System ownership is determined by which country has a starbase there (via `starbase_mgr` fleet-based ownership chain).
 
 ### Planet IDs vs system IDs
 
-The IDs in `planet=N` lines inside a galactic_object are planet IDs in the `planets=` section (NOT galactic_object IDs). These are different namespaces. Example: system 0 (Despad) has planets 1569–1582 and 7862. The system itself has ID 0 as a galactic_object.
+The IDs in `planet=N` lines inside a galactic_object are planet IDs in the `planets=` section (NOT galactic_object IDs). These are different namespaces.
 
-### `controlled_planets` relationship
+### Planet→system→sector chain (Pass 8)
 
-Country 0's `controlled_planets` list (see §8) contains BOTH:
-- Galactic_object IDs (system IDs, 0-783) — 208 of them match for country 0
-- Planet IDs from the planets section — ~1348 of them
-
-The 208 system IDs in controlled_planets correspond to systems where country 0 has colonies (not all starbase systems). So this list CANNOT be used to count all owned systems.
+The script uses `galactic_object` to build a mapping: for each `planet=N` at depth 2, record which system it's in. Then using `sector=N` at depth 2, map system→sector. Combined with sector data (pass 7), this gives the full chain: planet → system → sector → local_capital → governor.
 
 ---
 
@@ -257,21 +247,17 @@ planets=          ← D0
             owner=0                     ← D3 (country that owns it)
             original_owner=0            ← D3
             controller=0                ← D3
-            pop_groups= { 419431466 1229 2164263088 }  ← D3 (pop_group IDs, NOT inline data)
-            pop_jobs= { 650 651 ... }   ← D3 (pop_job IDs)
-            districts= { 16777853 646 647 16777674 }   ← D3 (district IDs → look up in districts= section)
-            last_district_changed="district_mindlink"  ← D3
+            pop_groups= { 419431466 1229 2164263088 }  ← D3 (pop_group IDs)
+            districts= { 16777853 646 647 16777674 }   ← D3 (district IDs)
             colonize_date="2200.01.01"  ← D3
             num_sapient_pops=9616       ← D3
-            final_designation="col_capital_hive"       ← D3
-            ascension_tier=5            ← D3 (0-5, max = highest tier)
-            stability=89.08             ← D3
-            species_refs= { 609 }       ← D3 (species IDs on this planet)
+            ascension_tier=5            ← D3 (0-5, affects empire size)
+            governor=16777547           ← D3 (leader ID, only on sector capitals)
             species_information=        ← D3
             {                           ← D3 (opens to D4)
                 609=                    ← D4 (species ID)
                 {                       ← D4 (opens to D5)
-                    num_pops=9616       ← D5 ← USE THIS for pop counts per species per planet
+                    num_pops=9616       ← D5
                 }
             }
             ...
@@ -289,22 +275,12 @@ planets=          ← D0
 | `districts={ IDs }` | int array | District instance IDs → look up in `districts=` section for `level=` |
 | `species_information={}` | block | `species_id={ num_pops=N }` at D4/D5 |
 | `num_sapient_pops=N` | int | Total pops on this planet (sum check) |
-| `ascension_tier=N` | int | 0–5, affects planet capacity |
+| `ascension_tier=N` | int | 0–5, -5% per tier to pops/districts/colony empire size |
+| `governor=N` | int | Leader ID of planet governor (only present on sector capitals) |
 
-### Critical: `districts=` array semantics in 4.x
+### District `level` semantics in 4.x
 
-In Stellaris 4.x, `districts={ 16777853 646 647 16777674 }` is a list of **district instance IDs**. Each ID references an entry in the global `districts=` section (at line 4503998). These IDs do NOT directly tell you the count — you must look up each ID in `districts=` to get its `level` (the stacked count of that district type built on this planet).
-
-For planet 10 (home planet with ascension_tier=5):
-- `16777853` → `district_hive_3`, level=5
-- `646` → `district_hive_2`, level=4
-- `647` → `district_hive_1`, level=3
-- `16777674` → `district_mindlink`, level=15
-- **Total: 5+4+3+15 = 27 district levels** on the home planet
-
-### Critical: planet pops use `species_information`, NOT `pop_groups`
-
-The `pop_groups=` in a planet block lists pop_group object IDs (pointers to global pop_group objects). **Do not try to parse pop_groups inline.** Use `species_information={ species_id={ num_pops=N } }` instead — it directly gives the pop count per species per planet.
+Each district instance has a `level=N` field representing how many of that type are built. Empire size counts `N × 0.5` per district object.
 
 ---
 
@@ -312,119 +288,65 @@ The `pop_groups=` in a planet block lists pop_group object IDs (pointers to glob
 
 **Location:** depth 0 at line 1247753. Contains all countries (player, AI, enclaves, etc.).
 
-### Country 0 block location
-
-```
-country=          ← D0 line 1247753
-{                 ← D0 (opens to D1)
-    0=            ← D1 (line 1247755 — country 0 = player)
-    {             ← D1 (opens to D2)
-        ...       ← D2: country 0 data fields
-    }             ← back to D1
-    1=            ← D1 (next country)
-    ...
-}
-```
-
 ### Key fields inside country 0 (all at depth 2)
 
 | Field | Approx line | Notes |
 |-------|-------------|-------|
-| `save_on_death=1` | 1247757 | Usually first field |
-| `name= { key="Prime Empire" }` | 1247782 | Country name |
-| `tech_status= { ... }` | 1247804 | Technology block — see below |
+| `name= { key="Pandora" }` | 1247782 | Country name |
+| `tech_status= { ... }` | 1247804 | Technology block |
 | `empire_size=1482` | ~1253879 | **Game-reported empire size** |
 | `num_sapient_pops=172999` | ~1253882 | Total pops (all planets) |
-| `graphical_culture="biogenesis_01"` | ~1253884 | Used to identify this country's starbases |
+| `graphical_culture="biogenesis_01"` | ~1253884 | Visual culture |
+| `government= { civics= { ... } }` | D2/D3/D4 | Government with civics list |
 | `traditions= { "tr_..." }` | ~1468570 | String array of active traditions |
 | `ascension_perks= { "ap_..." }` | ~1468622 | String array |
-| `owned_armies= { ... }` | ~1468632 | Army ID list |
-| `owned_planets= { 10 517 757 ... }` | ~1468636 | 44 colony planet IDs (integer array) |
-| `restricted_systems= { ... }` | ~1468640 | 6 restricted system IDs |
-| `controlled_planets= { ... }` | ~1468644 | Large mixed list (see below) |
+| `owned_planets= { 10 517 757 ... }` | ~1468636 | 44 colony planet IDs |
+| `controlled_planets= { ... }` | ~1468644 | Large mixed list |
 | `edicts= { { edict="key" ... } }` | ~1468656 | Active edicts block |
+| `fleets_manager= { owned_fleets= { ... } }` | D2/D3/D4/D5 | Fleet ownership |
+
+### `fleets_manager` format (for system ownership)
+
+```
+fleets_manager=
+{
+    owned_fleets=
+    {
+        {
+            fleet=0            ← D5 (fleet ID)
+        }
+        {
+            fleet=4            ← D5 (fleet ID)
+        }
+        ...
+    }
+}
+```
+
+The `owned_fleets` list contains fleet IDs at D5. These are used in pass 5 to verify system ownership: starbase → station ship → ship's fleet → check against owned_fleets.
+
+### `government` and civics format
+
+```
+government=
+{
+    type="auth_bio_hive_mind_evopred"   ← D3
+    civics=                              ← D3
+    {                                    ← D3 (opens to D4)
+        "civic_hive_natural_neural_network"  ← D4
+        "civic_hive_ascensionists"           ← D4
+        "civic_hive_divided_attention"       ← D4
+    }
+}
+```
+
+Civics are quoted strings at D4 inside the `civics={}` block.
 
 ### `tech_status=` format
 
-NOT a simple array. Each technology is stored as two consecutive lines:
-```
-tech_status=
-{
-    technology="tech_maulers"   ← D3
-    level=1                     ← D3
-    technology="tech_weavers"   ← D3
-    level=1                     ← D3
-    ...
-    technology="tech_psionic_theory"   ← appears at ~relative line 466 from country start
-    level=1
-    ...
-    "tech_lost_building_methods"="64"  ← NOTE: different format for some repeatable techs!
-}
-```
-The repeatable techs use `"tech_key"="level"` format (quoted key + numeric level). Regular techs use `technology="key"\nlevel=N` two-line format. Both need to be handled.
-
-### `traditions=` format (depth 3 string array)
-
-```
-traditions=
-{
-    "tr_supremacy_adopt"
-    "tr_supremacy_fleet_logistical_corps"
-    ...49 entries total for country 0...
-    "tr_statecraft_finish"
-}
-```
-All traditions are quoted strings at depth 3.
-
-### `ascension_perks=` format (same as traditions)
-
-Country 0 has: `ap_imperial_prerogative`, `ap_enigmatic_engineering`, `ap_engineered_evolution`, `ap_behemoths`, `ap_galactic_force_projection`, `ap_galactic_wonders_utopia_and_megacorp`, `ap_master_builders`
-
-### `owned_planets=` format (integer array at depth 3)
-
-```
-owned_planets=
-{
-    10 517 757 4299 6769 6280 4374 824 121 596 595 594 624 169 4965 4942
-    6135 1991 7935 267 2509 791 72 3295 81 4345 4306 3518 312 7468 175
-    6020 663 225 880 3977 578 249 682 899 3095 341 951 4991
-}
-```
-44 planet IDs. These are used to filter which planets to scan for districts/pops.
-
-### `controlled_planets=` (large mixed-namespace integer array)
-
-Contains ~1556 IDs. These are a MIX of:
-1. **Galactic object IDs** (0–783): star system objects — 208 of these for country 0
-2. **Planet IDs** (large numbers): individual planet objects in owned systems
-
-**Do not use this to count owned systems.** Only 208 of the 432 star systems appear here (only colonized systems have their star ID in this list). Use the starbase counting method instead.
-
-### `edicts=` format (depth 4 key inside blocks)
-
-```
-edicts=
-{
-    {                               ← D3 (anonymous block)
-        edict="crystal_focus"       ← D4
-        date="-5070.07.21"         ← D4
-        perpetual=yes               ← D4
-        start_date="2298.05.18"    ← D4
-    }
-    {
-        edict="fuel_gases"
-        ...
-    }
-    ...
-}
-```
-Active edicts for country 0 (in q2): `crystal_focus`, `fuel_gases`, `motes_kinetic`, `living_metal_construction`, `motes_armor`.
-
-### Flags in country 0
-
-The country flags section (inside country 0's block) contains important state:
-- `bio_mutation=63621816` — flag confirming Chimeral Consciousness is active (set by event `bio.195`)
-- Other biogenesis flags, event chain completion flags, etc.
+Two formats:
+1. Normal: `technology="tech_key"` + `level=N` on consecutive lines at D3
+2. Repeatable: `"tech_key"="level"` single-line at D3
 
 ---
 
@@ -444,52 +366,46 @@ starbase_mgr=
         0=             ← D2 (starbase ID)
         {
             level="starbase_level_citadel"    ← D3
-            type="sshipyard"                  ← D3 (construction_type equivalent)
-            modules= { 0=shipyard ... }       ← D3
-            buildings= { 0=crew_quarters ... } ← D3
-            update_flag=2048                   ← D3
-            build_queue=2354                   ← D3
-            station=0                          ← D3 ← CRITICAL: this is a SHIP ID (not fleet ID)
-            orbitals= { 0=4294967295 ... 2=16780879 3=184552984 }  ← D3
-            construction_type=starbase_shipyard ← D3 (only on developed starbases)
-        }
-        1=
-        {
-            level="starbase_level_starfortress"
-            station=6                          ← ship ID 6 (not fleet 6!)
+            station=0                          ← D3 ← SHIP ID (not fleet ID)
+            modules= { ... }                  ← D3
+            buildings= { ... }                ← D3
+            orbitals= { ... }                 ← D3
             ...
         }
-        ...
     }
 }
 ```
 
-### CRITICAL: `station=N` is a SHIP ID, not a fleet ID
+### System counting via fleet ownership (implemented)
 
-This was the key discovery for starbase ownership. Fleet IDs in the save are NOT sequential (they use type-prefix encoding and skip many values). Ship IDs ARE sequential starting from 0.
+The script uses a fleet-based ownership chain:
+1. Capture `station=N` (ship ID) and `level="..."` per starbase
+2. Look up ship N → get its `fleet=M`
+3. Check if fleet M is in the country's `owned_fleets`
+4. Only count if `level` is in `SYSTEM_STARBASE_LEVELS`
 
-For example:
-- Starbase 0: `station=0` → ship 0 → `graphical_culture="biogenesis_01"` → country 0's starbase
-- Starbase 1: `station=6` → ship 6 → `graphical_culture="humanoid_01"` → another country's starbase
-- Starbase 2: `station=12` → ship 12 → `graphical_culture="plantoid_01"` → yet another country
+This correctly excludes:
+- **Orbital rings** (`starbase_level_orbital_ring`) — 4 in q2 save
+- **Deep space citadels** (`starbase_level_deep_space_citadel`) — 4 in q2 save
+- **Other countries' starbases** — eliminated by fleet ownership check
 
-The station values increment by 6 (0, 6, 12, 18...) because each starbase system has exactly one ship entry (the station ship). They're every 6th ship because in between are other ship types from non-station fleets.
+### SYSTEM_STARBASE_LEVELS
 
-### Orbital platforms
-
-Some starbases are **orbital platforms** (secondary stations in the same system). They appear in the `orbitals={}` block of a main starbase (non-4294967295 values). Orbitals add ~34 extra starbases to the country 0 count, giving 466 vs the correct 432 systems.
-
-Orbital IDs in the `orbitals={}` block use entity-encoded IDs (like `16780879 = 16777216 + 3663`). These do NOT directly map to starbase IDs, making it hard to exclude them programmatically without a cross-reference.
-
-**Practical workaround:** Use count × 0.926 as approximation, or accept the ~8% overcount.
+```python
+{
+    'starbase_level_outpost',
+    'starbase_level_starport',
+    'starbase_level_starhold',
+    'starbase_level_starfortress',
+    'starbase_level_citadel',
+}
+```
 
 ---
 
 ## 10. Ships (`ships=`)
 
 **Location:** depth 0 at line 2459386.
-
-**Total:** 7301 ships across all entities, 6334 have `graphical_culture`.
 
 ### Structure
 
@@ -499,41 +415,17 @@ ships=
     0=             ← D1 (ship ID)
     {
         fleet=0                         ← D2 (fleet this ship belongs to)
-        name= { key="STARBASE_STATION_NAME_FORMAT_NON_PRIMARY" ... }  ← D2
-        reserve=0                       ← D2
-        ship_design_implementation= { design=268435591 ... }  ← D2
-        graphical_culture="biogenesis_01"  ← D2 ← identifies owning country
-        section= { ... }                ← D2
+        graphical_culture="biogenesis_01"  ← D2
         ...
     }
-    6=
-    {
-        fleet=4
-        graphical_culture="humanoid_01"
-        ...
-    }
-    ...
 }
 ```
 
-### Using `graphical_culture` for ownership
+### Fleet-based ownership (replaces graphical_culture heuristic)
 
-Each ship has a `graphical_culture` matching the country that built it. For starbase ships:
-- `"biogenesis_01"` = country 0 (the player's Hive Mind / biogenesis empire)
-- `"biogenesis_01_fallen_empire"` = a different fallen empire with biogenesis culture (NOT country 0)
+The v0.1 approach used `graphical_culture` to match ships to countries. This failed because multiple countries can share the same culture (e.g., "biogenesis_01" matched 1358 ships across multiple countries).
 
-To count country 0's starbases: `starbase.station=N` → look up ship N → check `ship.graphical_culture == "biogenesis_01"`.
-
-### Ship culture counts (q2 save)
-
-From scanning all ships:
-| Culture | Count |
-|---------|-------|
-| biogenesis_01 | 1358 |
-| biogenesis_01_fallen_empire | 741 |
-| humanoid_01 | 713 |
-| avian_01 | 510 |
-| ... | ... |
+The v0.2 approach uses `fleet=N` per ship, then checks if that fleet is in the country's `owned_fleets`. This gives exact ownership.
 
 ---
 
@@ -541,42 +433,11 @@ From scanning all ships:
 
 **Location:** depth 0 at line 3191312.
 
-**Total:** 3677 fleet objects. Fleet IDs are NOT sequential — they use type-prefix encoding, so fleet 5 might not exist while fleet 50331653 does.
+Fleet IDs are NOT sequential — they use type-prefix encoding.
 
-### Structure
+### Fleet ownership
 
-```
-fleet=
-{
-    0=             ← D1 (fleet ID)
-    {
-        name= { key="shipclass_starbase_name" ... }  ← D2 (starbase fleet identifier)
-        ships= { 0 }        ← D2-D3 (ship IDs in this fleet)
-        combat= { ... }     ← D2
-        fleet_stats= { ... }  ← D2
-        station=yes          ← D2 (marks this as a station/starbase fleet)
-        orbital_station=yes  ← D2
-        hit_points=219572    ← D2
-        ...
-    }
-    ...
-}
-```
-
-### Fleet ownership gotcha
-
-Fleet entries DO have an `owner=` field, but it is NOT a country ID. The value is an **entity-encoded ID** such as `owner=16777241 = 16777216 + 25`. This appears to encode "planet entity 25" (or similar), not "country 25". Regular country IDs (0, 1, 2...) do NOT appear in fleet `owner=` fields.
-
-**Do NOT use fleet `owner=` to determine which country owns a starbase.** Use the starbase → ship → graphical_culture chain instead.
-
-### Identifying starbase fleets
-
-Starbase fleets have:
-- `station=yes` at depth 2
-- `orbital_station=yes` at depth 2
-- Name key `"shipclass_starbase_name"` at depth 3 (inside `name={}`)
-
-However, `station=yes` also appears on other non-starbase station types (orbital science labs, listening posts, etc.), so there are 3162 "station fleets" even though there are only 724 starbases.
+Fleet entries have an `owner=` field, but it is NOT a country ID (it's an entity-encoded ID). **Do NOT use fleet `owner=` to determine which country owns a starbase.** Use the country's `fleets_manager → owned_fleets` list instead.
 
 ---
 
@@ -584,52 +445,21 @@ However, `station=yes` also appears on other non-starbase station types (orbital
 
 **Location:** depth 0 at line 4503998 (NOT inside planets= — it's a separate top-level section).
 
-**Total:** Contains ALL district objects for the ENTIRE game.
-
 ### Structure
 
 ```
 districts=
 {
-    16777216=       ← D1 (district instance ID — NOT sequential from 0)
+    16777216=       ← D1 (district instance ID)
     {
-        zones= { 548 }              ← D2 (zone IDs within this district)
+        zones= { 548 }              ← D2
         type="district_generator"   ← D2
-        level=3                     ← D2 ← STACKED COUNT (how many of this type built)
+        level=3                     ← D2 ← STACKED COUNT
     }
-    2=              ← D1 (note: IDs are non-sequential, mixed large and small values)
-    {
-        zones= { 2 98 99 }
-        type="district_hive_1"
-        level=5
-    }
-    ...
 }
 ```
 
-### District `level` semantics
-
-In Stellaris 4.x with the zone system:
-- Each planet has a few district TYPE STACKS (one entry per district type)
-- `level=N` = how many of that type are built = contributes N × `EMPIRE_SIZE_FROM_DISTRICTS` (0.5) to empire size
-- The `zones={}` block lists the zone instances within the district (each zone slot has a building or is empty)
-- IDs in the `zones` array are NOT useful for empire size calculation
-
-### Example: Home planet 10's districts
-
-| District ID | Type | Level | Empire size contribution |
-|-------------|------|-------|--------------------------|
-| 16777853 | district_hive_3 | 5 | 2.5 |
-| 646 | district_hive_2 | 4 | 2.0 |
-| 647 | district_hive_1 | 3 | 1.5 |
-| 16777674 | district_mindlink | 15 | 7.5 |
-| **Total** | | **27** | **13.5** |
-
-The grand total across all 44 owned planets = **777 district levels** (verified against game tooltip).
-
-### Parsing note
-
-District IDs from planet's `districts={}` array are a mix of small integers (like 646) and large integers (like 16777853). There are NO sequential IDs — you must scan the whole `districts=` section to build a lookup `id → level`. The section is large (~96K lines) so searching by ID for each district is O(n×m) without a pre-built index. Build the full `{id: level}` dict once, then look up.
+`level=N` = how many of that type are built = contributes N × 0.5 to empire size.
 
 ---
 
@@ -637,61 +467,78 @@ District IDs from planet's `districts={}` array are a mix of small integers (lik
 
 **Location:** depth 0 at line 4596154.
 
-The Growing Pains situation (`behemoth_finale_situation`) is in this section:
-
-```
-situations=
-{
-    ...
-    {                                         ← anonymous block
-        country=0
-        target= { type=country id=0 ... }
-        type="behemoth_finale_situation"
-        progress=219.33                       ← CURRENT PROGRESS
-        last_month_progress=1.965             ← LAST MONTH GAIN
-        approach="behemoth_finale_approach_digestion"
-        stage_durations= { ... }
-    }
-}
-```
-
-### Stage thresholds
-
-| Stage | Progress Range | Event on Enter |
-|-------|---------------|----------------|
-| 1 | 0 → 80 | `biocrisis.210` |
-| 2 | 80 → 180 | `biocrisis.215` |
-| 3 | 180 → 300 | `biocrisis.220` |
-| 4 | 300 → 440 | `biocrisis.225` |
-| 5 | 440 → 600 | `biocrisis.230` |
-| 6 | 600 → 780 | `biocrisis.235` |
-| 7 | 780 → 980 | `biocrisis.240` |
-| 8 | 980 → 1200 | `biocrisis.245` |
-| Final | 1200 | `biocrisis.250` (superweapon) |
+The Growing Pains situation (`behemoth_finale_situation`) is in this section.
 
 ---
 
 ## 14. Leaders (`leaders=`)
 
-**Location:** depth 0 at line 2459247. Contains ALL leader objects.
+**Location:** depth 0 at line 2407429. Contains ALL leader objects.
 
-**Relevant for:** Governor `species_empire_size_mult` — the biggest unresolved gap in the script. Each planet governor contributes `-0.02 × skill_level` as `species_empire_size_mult` to all pops on their planet.
+### Structure
 
-### How to parse governor effects (NOT YET IMPLEMENTED)
-
-1. In `country=` block for country 0, find the government/officials data to identify which leaders are governors
-2. In `leaders=` section, find each leader by ID and read their `skill=N` level
-3. For each planet: look up the governor's skill, compute `-0.02 × skill` (planet) or `-0.01 × skill` (sector)
-4. Apply this as additional `species_empire_size_mult` on top of evopred modifier, for all pops on that planet
-
-This is the primary missing piece (~-17% to -22% of pops component).
-
-Governor modifier source: `common/static_modifiers/00_static_modifiers.txt`
-```pdx
-skill_official_planet_governor = {
-    species_empire_size_mult = -0.02    # per skill level
-}
-skill_official_sector_governor = {
-    species_empire_size_mult = -0.01    # per skill level
+```
+leaders=
+{
+    16777547=        ← D1 (leader ID)
+    {
+        level=7                    ← D2
+        bonus_skill_level=0        ← D2
+        class="official"           ← D2
+        traits="leader_trait_adaptable"  ← D2 (repeating key)
+        traits="leader_trait_urbanist"   ← D2
+        ...
+    }
 }
 ```
+
+### Key fields at depth 2
+
+| Field | Description |
+|-------|-------------|
+| `level=N` | Base skill level |
+| `bonus_skill_level=N` | Additional skill levels (from traits, etc.) |
+| `class="..."` | `official`, `commander`, `scientist` |
+| `traits="..."` | Repeating key, one per trait |
+
+### Governor skill calculation
+
+Effective skill = `level + bonus_skill_level`.
+
+Each planet's governor is identified by the `governor=<leader_id>` field in the planet block (§7). Only sector capital planets have this field. Other planets in the sector receive the sector governor rate (-0.01/level instead of -0.02/level).
+
+---
+
+## 15. Sectors (`sectors=`)
+
+**Location:** depth 0 at line 4494626.
+
+### Structure
+
+```
+sectors=
+{
+    5=              ← D1 (sector ID)
+    {
+        owner=0                 ← D2 (country ID)
+        local_capital=10        ← D2 (planet ID of sector capital)
+        systems=                ← D2
+        {                       ← D2 (opens to D3)
+            0                   ← D3 (system IDs)
+            1
+            2
+            ...
+        }
+    }
+}
+```
+
+### Key fields at depth 2
+
+| Field | Description |
+|-------|-------------|
+| `owner=N` | Country ID that owns this sector |
+| `local_capital=N` | Planet ID of sector capital (has `governor=` field) |
+| `systems={...}` | List of galactic_object (system) IDs in this sector |
+
+The sector data links systems to their sector, which links to the sector capital, which links to the governor via the planet's `governor=` field.

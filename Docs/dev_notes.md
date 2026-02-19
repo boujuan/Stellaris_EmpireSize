@@ -1,32 +1,43 @@
 # Script Development Notes
 
-Technical notes on `empire_size.py`: architecture, parser design, bugs hit, and next steps.
+Technical notes on `empire_size.py`: architecture, parser design, bugs hit, and remaining tasks.
 
 ---
 
 ## 1. Architecture Overview
 
-The script does 5 sequential passes through the 65MB `gamestate` file (no pre-loading into memory):
+The script does 8 sequential passes through the 65MB `gamestate` file (no pre-loading into memory):
 
 ```
 Pass 1: species_db= (lines 50–30310)
     → Build {species_id: {traits, evopred_count}}
 
 Pass 2: country= (lines 1247753–2219786)
-    → Extract traditions, techs, perks, owned_planets, controlled_planets,
-      empire_size, num_sapient_pops, graphical_culture
+    → Extract traditions, techs, perks, civics, owned_planets, controlled_planets,
+      empire_size, num_sapient_pops, owned_fleets
 
 Pass 3: planets= (lines 383890–1232516)
-    → For each owned planet: collect district IDs and species_information
+    → For each owned planet: collect district IDs, species_information,
+      ascension_tier, governor leader ID
 
 Pass 4: districts= (lines 4503998–4599137)
     → For each district ID from pass 3: look up level value
 
-Pass 5: ships= (lines 2459386–3191312) + starbase_mgr= (lines 370032–383890)
-    → Build ship_id→culture map, then count starbases for country_culture
+Pass 5: starbase_mgr= + ships= (lines 370032–3191312)
+    → Fleet-based system count: station→ship→fleet→owned_fleets chain
+      with starbase level filtering (SYSTEM_STARBASE_LEVELS)
+
+Pass 6: leaders= (lines 2407429–2459386)
+    → For governor leader IDs from pass 3: extract skill level, class, traits
+
+Pass 7: sectors= (lines 4494626–4503998)
+    → For country's sectors: local_capital, systems list, owner
+
+Pass 8: galactic_object= (lines 299792–370032)
+    → Build planet→system→sector chain for governor coverage mapping
 ```
 
-The 5 passes are in different order than sections appear in the file (starbase_mgr at ~370K is scanned after ships at ~2.4M). This means passes 3 and 5 both require scanning backwards relative to each other — no optimization is possible without two-pass pre-indexing. Runtime is acceptable (~30-60 seconds for the 65MB file on modern hardware).
+Passes are not in file order (e.g., pass 8 reads galactic_object which is earlier in the file than sectors from pass 7). With OS file caching after the first pass, this is acceptable. Runtime: ~30-60 seconds total on modern hardware.
 
 ---
 
@@ -79,7 +90,7 @@ def _count_braces(s):
     return opens, closes
 ```
 
-Handles braces inside quoted strings correctly. Only issue: escaped quotes `\"` inside strings could theoretically cause issues, but they don't appear in PDX format.
+Handles braces inside quoted strings correctly.
 
 ---
 
@@ -123,8 +134,6 @@ key=
 
 The `key=` line at depth D has NO braces (opens=0, closes=0). The following `{` line at depth D opens to depth D+1. Code must track that a key at depth D means the block's content is at depth D+1 on the next and subsequent lines.
 
-The simplest approach: set a flag when `key=` is seen, and check/use that flag when processing depth D+1 lines. Reset the flag when a different depth-D key is encountered.
-
 ### Challenge: `tech_status=` dual format
 
 Technologies have TWO formats in tech_status:
@@ -137,7 +146,7 @@ level=1
 
 2. Repeatable tech format:
 ```
-"tech_repeatable_improved_starbase_capacity"="82"
+"tech_lost_building_methods"="64"
 ```
 
 The script handles format 1 (building `pending_technology` when `technology="..."` is seen, then appending when `level=` follows). Format 2 (quoted key = level as single line) is NOT currently handled. Repeatable techs don't affect empire size, so this omission is acceptable.
@@ -146,35 +155,43 @@ The script handles format 1 (building `pending_technology` when `technology="...
 
 **Initial wrong assumption:** `station=N` in starbase entries is a fleet ID.
 
-**Evidence that it's wrong:** Fleet IDs are non-sequential. Fleet 6 doesn't exist. But `station=6` appears in starbase 1.
+**Discovery:** Ship IDs ARE sequential. Testing `starbase.station = ship_id` → ship's `fleet=fleet_id` → check against country's `owned_fleets` correctly identifies ownership.
 
-**Discovery:** Ship IDs ARE sequential. Ship 6 exists and has `fleet=4` and `graphical_culture="humanoid_01"`. Testing `starbase.station = ship_id` → `ship.graphical_culture` correctly identifies ownership.
+### Challenge: Civics extraction — if/elif chaining
 
-**Why station values skip by 6:** Station values are 0, 6, 12, 18... because each starbase station ship is 1 of every 6 ships (the other 5 in between belong to mobile fleets or other stations in that system).
+When parsing `civics=` inside the `government={}` block, the entry condition (`civics=` at depth 3) and exit condition (depth <= 3, non-brace) can match on the **same line**. The `civics=` line itself is a non-brace line at depth 3, so checking both conditions in separate `if` blocks causes the flag to be set and immediately unset.
 
-### Challenge: `controlled_planets` doesn't give system count
-
-Initial approach: use galactic_object IDs in `controlled_planets` to count owned star systems.
-
-**Problem:** Only 208 of 432 owned systems have their galactic_object ID in `controlled_planets`. The remaining 224 systems have starbases but aren't in this list (they're non-colonized systems with outposts only, apparently).
-
-**Solution:** Use the starbase counting method (starbase → ship → graphical_culture).
-
-### Challenge: Planet section depth is 3, not 2
-
-Planet section structure is `planets= { planet= { N= { content } } }`, giving content at depth 3, not depth 2 as initially assumed.
-
-```
-planets=   ← D0
-{          ← D0 → D1
-    planet= ← D1 (note: this wrapper key exists!)
-    {       ← D1 → D2
-        10= ← D2 (planet ID)
-        {   ← D2 → D3
-            owner=0  ← D3 (planet content)
+**Fix:** Use `elif` chaining so the exit condition only fires when the entry condition doesn't:
+```python
+if in_government and depth == 3 and line.startswith('civics='):
+    in_civics_block = True
+elif in_civics_block and depth == 4:
+    # capture civic
+elif in_civics_block and depth <= 3 and line not in ('{', '}'):
+    in_civics_block = False
 ```
 
-If you assume planet IDs are at D1, you'll get `planet=` as the first entry, then miss all actual planet entries.
+### Challenge: Sector systems — brace lines triggering exit
+
+When parsing `systems={}` inside a sector block, the `{` on its own line after `systems=` would trigger the exit condition (`depth <= 2, non-brace`... except `{` wasn't excluded). Same pattern for galactic_object planet blocks.
+
+**Fix:** Add `and line not in ('{', '}')` to all sub-block exit conditions.
+
+### Challenge: Leader finalize — premature save on `{`
+
+After matching a leader ID like `16777547=` at depth 1 and setting `current_id`, the next line `{` (also at depth 1 before opens) triggered the finalize-and-save block, storing the leader with all-zero fields before any depth 2 data was captured.
+
+**Fix:** Check `line not in ('{', '}')` in the depth 1 finalize block, and add `if depth <= 1: continue` to skip brace lines.
+
+### Challenge: Galactic object planets — not a sub-block
+
+Planets in `galactic_object` are individual `planet=<id>` entries at depth 2, NOT a sub-block with IDs at depth 3. The format is simply:
+```
+planet=1569
+planet=1570
+```
+
+**Fix:** Capture `planet=(\d+)` at depth 2 directly instead of looking for a block.
 
 ---
 
@@ -193,6 +210,8 @@ If you assume planet IDs are at D1, you'll get `planet=` as the first entry, the
 - Critical exit conditions: MUST use `line not in ('{', '}')` for D0 exit check
 - `tech_status` uses pending-key approach: `technology="key"` sets `pending_technology`, then `level=` triggers append
 - All major lists (traditions, perks, owned_planets, controlled_planets) use same pattern: detect `key=` at D2, set flag, collect at D3
+- **Civics:** Parsed from `government={civics={...}}` at D3/D4 with `elif` chaining (see §3)
+- **Owned fleets:** Parsed from `fleets_manager={owned_fleets={{fleet=N}...}}` block, fleet IDs at D5
 
 ### `extract_planet_data(path, owned_planet_ids)`
 
@@ -200,6 +219,8 @@ If you assume planet IDs are at D1, you'll get `planet=` as the first entry, the
 - Scans entire `planets=` section but only processes owned planets
 - District IDs: simple integer array at D4 (inside `districts=` at D3)
 - Pop counts: `species_information= { species_id= { num_pops=N } }` at D3/D4/D5
+- **Ascension tier:** `ascension_tier=N` at D3 (default 0)
+- **Governor:** `governor=<leader_id>` at D3 (only on sector capital planets)
 
 ### `extract_district_levels(path, district_ids)`
 
@@ -207,83 +228,71 @@ If you assume planet IDs are at D1, you'll get `planet=` as the first entry, the
 - For each district in needed set, reads `level=` at D2
 - Returns early when all needed IDs are found
 
-### `count_owned_systems(path, graphical_culture)`
+### `count_owned_systems(path, owned_fleet_ids)`
 
-Two-pass approach:
-1. Scan `ships=` to build `{ship_id: graphical_culture}` dict
-2. Scan `starbase_mgr=` to count starbases where `station=ship_id` maps to the target culture
+Fleet-based ownership approach:
+1. Scan `ships=` to build `{ship_id: fleet_id}` dict
+2. Scan `starbase_mgr=` to count starbases where:
+   - `level` is in `SYSTEM_STARBASE_LEVELS` (outpost/starport/starhold/starfortress/citadel)
+   - `station=ship_id` → ship's `fleet=fleet_id` → fleet_id is in `owned_fleet_ids`
+3. Returns tuple: `(system_count, total_matched, excluded_count)`
 
-**Caveat:** Counts include orbital platforms (~34 extra for country 0). True system count ≈ result × 0.927.
+Non-system starbases (orbital rings, deep space citadels) are excluded by level filtering. Other countries' starbases are excluded by fleet ownership check.
+
+### `extract_leader_data(path, leader_ids)`
+
+- Scans `leaders=` section for specified leader IDs
+- For each leader: extracts `level`, `bonus_skill_level`, `class`, `traits` at D2
+- Returns `{leader_id: {'skill': level + bonus_skill_level, 'class': str, 'traits': [str]}}`
+- Key: finalize logic runs on depth 1 non-brace lines only (see §3)
+
+### `extract_sector_data(path, country_id)`
+
+- Scans `sectors=` section for sectors with `owner=<country_id>`
+- For each sector: captures `local_capital=<planet_id>` and `systems={...}` at D2
+- Returns `{sector_id: {'local_capital': planet_id, 'systems': [int]}}`
+
+### `build_planet_to_sector_map(path, sector_data)`
+
+- Scans `galactic_object=` section to build planet→system mapping
+- Combines with sector_data (system→sector mapping) to build full chain:
+  planet → system → sector → local_capital → is_sector_capital? → sector_governor
+- Returns `{planet_id: {'sector_id': int, 'is_sector_capital': bool, 'sector_governor': int|None}}`
+- The sector_governor comes from the capital planet's `governor=` field
 
 ---
 
-## 5. Known Issues and TODOs
+## 5. Known Issues and Remaining TODOs
 
-### TODO 1: Governor effects (HIGHEST PRIORITY)
+### RESOLVED: Governor effects
 
-Implement parsing of `leaders=` section to get governor skill levels and apply `species_empire_size_mult` per planet.
+Implemented in v0.2. Per-planet governor skill effects via planet→sector→governor chain. Result: pops gap reduced from +123 to -2.1.
 
-**What to parse:**
-- In country 0's data: look for the government section or officials/councilors to find which leaders are governors for which planets
-- In `leaders=` section: find each relevant leader's `skill=N`
+### RESOLVED: Orbital platforms / system overcount
 
-**Data location:**
-- `leaders=` section starts at line 2459247 (~732K lines)
-- Leader structure: `N= { class=official skill=N ... }`
-- Planet-to-governor mapping: likely in the planet's `governor=N` field (depth 3 in planet block)
+Implemented in v0.2. Two fixes:
+1. **Starbase level filtering** — only count levels in `SYSTEM_STARBASE_LEVELS`, excluding orbital rings and deep space citadels (-8 systems)
+2. **Fleet-based ownership** — ship→fleet→owned_fleets chain instead of graphical_culture matching (-26 systems from other countries)
 
-**Parsing approach:**
-1. In pass 3 (planet data), also extract `governor=N` field (leader ID for the planet's governor)
-2. New pass: scan `leaders=` to build `{leader_id: skill_level}` dict for all official-class leaders
-3. In calculation: for each owned planet, compute `governor_mult = -0.02 × skill` and apply to all pops on that planet
+### RESOLVED: District and colony -7.6%/-6.8% gaps
 
-**Expected gain:** Will close the +123 point pops discrepancy.
+Both explained by planet ascension tiers. Tier 5 planets with +25% effect_mult give -31.2% reduction. Applied per-planet in v0.2.
 
-### TODO 2: Identify orbital platforms
+### TODO 1: Councilor skill effects
 
-Better system count by excluding orbitals from starbase count.
+Council positions provide per-skill modifiers to empire size (e.g., Machine Intelligence ruler might give -3%/level pops). Not yet parsed. May explain the remaining -2.1 pops gap.
 
-**Approach A (scan orbitals blocks):**
-1. In pass 5, when scanning `starbase_mgr=`, collect all non-null orbital IDs from `orbitals={}` blocks
-2. These are entity-encoded IDs (like `16780879`). Need to figure out encoding to map back to starbase IDs.
-3. Entity encoding: `16777216 = 2^24`. Values like `16780879 = 16777216 + 3663` might mean starbase type 1, index 3663. Needs verification.
+### TODO 2: Governor traits
 
-**Approach B (correction factor):**
-Use `min(count, round(count × 0.927))` as an approximation. The ratio 432/466 = 0.927 is specific to this save state; it might vary.
+`GOVERNOR_TRAIT_MODIFIERS` is defined in SETTINGS but not yet applied. Example: `leader_trait_urbanist` gives -50% districts on governed planet, -25% on sector planets.
 
-### TODO 3: Identify -7.6% districts source
-
-Unknown source of `empire_size_districts_mult` giving -7.64%.
-
-**Places to investigate:**
-- `common/edicts/*.txt` — active edicts: `crystal_focus`, `fuel_gases`, `motes_kinetic`, `living_metal_construction`, `motes_armor`
-- `common/inline_scripts/buildings/on_all_capital_buildings.txt` — the Synaptic Extensions capital building (hive mind swap of tr_domination_imperious_architecture) might have district modifiers
-- `common/buildings/` — any building with `empire_size_districts_mult`
-- `common/governments/civics/02_gestalt_civics.txt` — Devouring Swarm civic modifiers (might have been missed)
-
-### TODO 4: Identify -6.8% colonies source
-
-Unknown source giving additional colonies reduction beyond -40% (Courier Network -15% + Imperial Prerogative -25%).
-
-**Calculate expected vs actual:**
-- Expected with known mods: `44 × 20 × 0.85 × 0.75 = 561`
-- Game shows: 492
-- Ratio: 492/561 = 0.877 → additional -12.3% on top of already-applied mods?
-
-Wait — let me reconsider. The mods are ADDITIVE:
-- -0.15 + -0.25 = -0.40
-- `44 × 20 × (1 - 0.40) = 528`
-- Game shows 492
-- 492/528 = 0.932 → additional **-6.8%** additive reduction
-
-**Possible sources:**
-- `ap_imperial_prerogative` might actually be -0.30 not -0.25 in 4.3
-- Some tradition may give additional -5% colonies for specific government types
-- Check `02_gestalt_civics.txt` Devouring Swarm swap for any colonies modifier
-
-### TODO 5: Handle repeatable tech format
+### TODO 3: Handle repeatable tech format
 
 Currently misses techs in `"tech_key"="level"` format (repeatable techs). Doesn't affect empire size currently but should be fixed for completeness.
+
+### TODO 4: Sector coverage gap
+
+15 of 44 planets are unmapped to sectors (galactic_object scan finds 29/44). These unmapped planets get no governor reduction. Likely an issue with the system→sector mapping for planets in systems that aren't in any sector's system list.
 
 ---
 
@@ -293,7 +302,7 @@ Currently misses techs in `"tech_key"="level"` format (repeatable techs). Doesn'
 
 `gamestate` for q2: ~65MB, ~4.6M lines. Each pass reads the entire file sequentially. With OS file caching (after first read), subsequent passes are fast.
 
-Typical runtime: 60-120 seconds total for 5 passes on a modern SSD (dominated by the `ships=` section parsing in pass 5, which is 732K lines).
+Typical runtime: 30-60 seconds total for 8 passes on a modern SSD.
 
 ### Optimization opportunities
 
@@ -301,7 +310,7 @@ Typical runtime: 60-120 seconds total for 5 passes on a modern SSD (dominated by
 
 2. **Single-pass alternative:** A single-pass state machine could extract all data simultaneously, but the code complexity would be much higher.
 
-3. **Memory:** The `ship_culture` dict from pass 5 holds up to 7301 entries — negligible memory. The `planet_data` dict (44 planets × their districts + pops) is also small.
+3. **Memory:** The `ship_fleet` dict from pass 5 holds ship→fleet mappings. The `planet_data` dict (44 planets × their districts + pops) is small. Leader and sector data are also small.
 
 ### Encoding
 
@@ -315,17 +324,13 @@ These two modifier types interact multiplicatively, NOT additively:
 
 ```python
 # CORRECT (multiplicative):
-pops_component = Σ(pops × base × (1 + species_mult)) × (1 + pops_mult)
+pops_component = Σ(pops × base × (1 + species_mult + gov_mult)) × asc_factor × (1 + pops_mult)
 
 # WRONG (additive would be):
 pops_component = Σ(pops × base × (1 + species_mult + pops_mult))
 ```
 
-Verification from data:
-- Without mod: `pops_raw = 865.0`, `pops_component = 865 × 0.85 = 735.25`
-- With mod (species 609 at -38%): `pops_raw = 546.03`, `pops_component = 546.03 × 0.85 = 464.12`
-
-The `empire_size_pops_mult` (-15%) is applied to the WHOLE sum of raw pop contributions, after per-species effects have already reduced individual contributions.
+Governor effects are additive with species_mult (both are per-pop), then ascension tier is multiplicative on the per-planet sum, then country-wide pops_mult is multiplicative on the total.
 
 ---
 
@@ -348,28 +353,6 @@ Added the modifier block to the `_no_happiness` file. The fix mod:
 - Location: `~/Coding/Mods/chimeral_consciousness_fix/`
 - Deployed (symlinked) to: `~/.local/share/Paradox Interactive/Stellaris/mod/`
 - **FIOS/LIOS behavior for inline_scripts:** DUPL (duplicates) — must replace entire file
-
-### Wiki FIOS/LIOS table for `inline_scripts`
-
-From the official wiki: `inline_scripts` are **DUPL** — "Only works when the file is fully replaced in my experience." This means our mod correctly provides the complete vanilla content + our fix.
-
-### Related authority bug
-
-The Chimeral Consciousness authority (`auth_bio_hive_mind_evopred`) uses `empire_size_penalty_mult = -0.20`. This is NOT a bug — it's an intentional secondary benefit (reduces tech/tradition cost penalty from empire size). The per-trait reduction is the primary mechanic (fixed by our mod) and the -20% penalty reduction is a separate, working bonus.
-
-### `is_mutation_authority` trigger
-
-```pdx
-is_mutation_authority = {
-    has_country_flag = bio_mutation
-}
-```
-
-The `bio_mutation` flag is set by event `bio.195` (Hive Mind path) when `tr_mutation_finish` tradition is adopted. Confirmed present in country 0's flags in both saves.
-
-### `species_traits_evopred_count` variable
-
-Set per-species by `set_species_traits_evopred_count_variable` scripted effect, which calculates it from `num_traits` on the species. The founder species (609) has count=38, matching the 38 traits listed in its definition.
 
 ---
 
@@ -409,41 +392,22 @@ effect add_situation_progress = 100    # Add 100 progress
 effect add_situation_progress = 1200   # Complete entire situation
 ```
 
-Stage events (from `common/situations/12_biogenesis_situations.txt`):
-- Stage 1 → 2 (at 80): `event biocrisis.210`
-- Stage 2 → 3 (at 180): `event biocrisis.215`
-- Stage 3 → 4 (at 300): `event biocrisis.220`
-- etc. (multiples of 5 up to biocrisis.250 for final)
-
 ---
 
 ## 11. Useful File Locations for Future Investigation
 
-### For governor effects (TODO 1)
+### For councilor effects (TODO 1)
+
+```
+common/council_positions/*.txt
+    → Check council position modifiers for empire size effects per skill level
+```
+
+### For governor traits (TODO 2)
 
 ```
 common/static_modifiers/00_static_modifiers.txt
-    skill_official_planet_governor → species_empire_size_mult = -0.02
-    skill_official_sector_governor → species_empire_size_mult = -0.01
-    (also: skill_commander_*, skill_scientist_* variants for governors)
-```
-
-### For district -7.6% gap (TODO 3)
-
-```
-common/inline_scripts/buildings/on_all_capital_buildings.txt
-    → Check hive mind capital building effects
-common/edicts/*.txt
-    → crystal_focus, fuel_gases, motes_kinetic, living_metal_construction, motes_armor
-common/static_modifiers/00_static_modifiers.txt
-    → empire_size_districts_mult occurrences
-```
-
-### For colonies -6.8% gap (TODO 4)
-
-```
-common/ascension_perks/00_ascension_perks.txt
-    → Verify ap_imperial_prerogative value in 4.3 (line ~1472)
-common/governments/civics/02_gestalt_civics.txt
-    → Check Devouring Swarm swap_type section (lines 277+)
+    → leader_trait_urbanist: planet_districts_empire_size_mult
+common/traits/50_leader_traits.txt
+    → Leader trait definitions and their modifier keys
 ```

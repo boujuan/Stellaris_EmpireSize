@@ -29,13 +29,15 @@ This project parses `gamestate` (the main file inside a `.sav` archive) to calcu
 
 ## Current Script Accuracy (q2 save, mod ON)
 
-| Component | Game Reports | Script Calculates | Gap | Cause |
-|-----------|-------------|-------------------|-----|-------|
-| Pops | 341.1 | 464.1 | **+123** | Governor `species_empire_size_mult` not parsed |
-| Districts | 358.8 | 388.5 | **+29.7** | Unknown ~-7.6% source |
-| Systems | 367.2 | 396.1 | **+28.9** | ~34 orbital platforms overcounting |
-| Colonies | 492.0 | 528.0 | **+36** | Unknown ~-6.8% source |
-| **Total** | **1482** | **1688** | **+13.9%** | |
+| Component | Game Reports | Script Calculates | Gap | Status |
+|-----------|-------------|-------------------|-----|--------|
+| Pops | 341.1 | 339.0 | **-2.1** | -0.6% (governor + ascension implemented) |
+| Districts | 358.8 | 358.8 | **0.0** | exact (ascension tiers) |
+| Systems | 367.2 | 367.2 | **0.0** | exact (fleet ownership + level filtering) |
+| Colonies | 492.0 | 492.0 | **0.0** | exact (ascension tiers) |
+| **Total** | **1482** | **1479** | **-0.2%** | |
+
+Remaining -2.1 pops gap likely from councilor skill effects or minor modifiers not yet catalogued.
 
 ---
 
@@ -46,7 +48,7 @@ This project parses `gamestate` (the main file inside a `.sav` archive) to calcu
 | `saves/q/` | With fix mod ON (same game state as q2) | 1482 |
 | `saves/q2/` | Same state, used as primary test | 1482 |
 
-Both saves correspond to the same game state with the fix mod active. To test vanilla (mod OFF), set `EVOPRED_PER_TRAIT_MULT = 0.0` in SETTINGS — this gives pops_component = 735.25 vs game's 575.4 (same 159-point governor gap).
+Both saves correspond to the same game state with the fix mod active. To test vanilla (mod OFF), set `EVOPRED_PER_TRAIT_MULT = 0.0` in SETTINGS.
 
 ---
 
@@ -67,3 +69,4 @@ Key subdirs referenced throughout:
 - `common/static_modifiers/` — governor/static modifier definitions
 - `common/situations/` — the Growing Pains situation
 - `common/script_values/` — `negative_empire_size_percent` formula
+- `common/planet_classes/` — planet designation ascension tier effects
