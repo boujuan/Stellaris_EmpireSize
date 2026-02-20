@@ -1,21 +1,29 @@
 #!/usr/bin/env python3
 """
-Stellaris Empire Size Breakdown Calculator v1.0
+Stellaris Empire Size Breakdown Calculator v1.1
 
 Parses a Stellaris 4.3 save game and calculates exact empire size contributions
 by component (pops, districts, systems, colonies), annotated with which modifiers
 are active. Reports discrepancies vs game-reported value to reveal missing sources.
 
 Usage:
-    python3 empire_size.py <save_folder> [country_id]
+    python3 empire_size.py <save_path> [country_id]
+
+    <save_path> can be:
+      - A .sav file (ZIP archive — gamestate extracted automatically)
+      - A folder containing an already-unzipped 'gamestate' file
 
 Examples:
-    python3 empire_size.py /home/boujuan/Desktop/q/q2
-    python3 empire_size.py /home/boujuan/Desktop/q/q 0
+    python3 empire_size.py saves/my_save.sav
+    python3 empire_size.py saves/q2/               # folder with gamestate
+    python3 empire_size.py saves/my_save.sav 0     # explicit country ID
 """
 
 import sys
 import re
+import zipfile
+import tempfile
+import shutil
 from pathlib import Path
 from collections import defaultdict
 
@@ -35,9 +43,8 @@ BASE = {
 }
 
 # Evolutionary Predators -1% empire size per trait
-# Applied as species_empire_size_mult via triggered_pop_group_modifier
-# when Chimeral Consciousness Fix mod is loaded.
-# Set to 0.0 to simulate vanilla (bug: modifier absent for hive mind drones).
+# Applied as species_empire_size_mult via triggered_pop_group_modifier.
+# Set to 0.0 if not using an authority with EvoPred traits.
 EVOPRED_PER_TRAIT_MULT = -0.01   # -1% per species_traits_evopred_count
 
 # Species traits → species_empire_size_mult (multiplicative per pop, before country pops mult)
@@ -139,6 +146,14 @@ ASCENSION_EFFECT_CIVICS = {
 # Source: common/static_modifiers/00_static_modifiers.txt lines 1305-1377
 # All governor classes (official, commander, scientist) use the same rates.
 # Planet and sector effects do NOT stack — each planet gets one rate.
+#
+# Effective governor skill = save:level + save:bonus_skill_level
+#   - level: base XP-based skill from leveling
+#   - bonus_skill_level: from leader_initial_skill at creation (e.g., capacity_boosters policy)
+#   - Verified: no governor trait has leader_skill_add in self_modifier
+#   - Verified: no country-wide leader_skill_add applies (no tr_aptitude_champions_of_the_empire)
+#   - background_planet_governor static modifiers have NO empire size effects
+# Remaining -2.1 pops gap (-0.6%) likely from game engine rounding or minor unidentified modifier.
 GOVERNOR_PLANET_RATE = -0.02   # Sector capital: direct planet governor
 GOVERNOR_SECTOR_RATE = -0.01   # Other sector planets: sector governor
 
@@ -160,6 +175,23 @@ GOVERNOR_TRAIT_MODIFIERS = {
         'planet': {'districts': -0.50},
         'sector': {'districts': -0.25},
     },
+}
+
+# Pop categories that do NOT include social_classes_triggered_modifiers
+# (or the _no_happiness variant). Pops in these categories do NOT receive
+# triggered_pop_group_modifier effects (e.g., evopred species_empire_size_mult).
+# Static species trait modifiers (trait_docile, trait_unruly) still apply to ALL pops.
+# Source: common/pop_categories/02_other_categories.txt
+POP_CATEGORIES_NO_TRIGGERED_MODIFIERS = {
+    'purge',
+    'criminal',
+    'assimilation',
+    'deviant_drone',
+    'corrupt_drone',
+    'precursor',
+    'xeno_ward',
+    'chip_slave',
+    'wilderness_heart_strata',
 }
 
 # ================================================================
@@ -592,6 +624,92 @@ def extract_planet_data(gamestate_path, owned_planet_ids):
     return planet_data
 
 
+def extract_pop_category_data(gamestate_path, owned_planet_ids):
+    """
+    Extract per-(planet, species) pop counts split by category eligibility.
+    Pass 4: iterates the pop_groups= section.
+
+    Pop categories in POP_CATEGORIES_NO_TRIGGERED_MODIFIERS do not receive
+    triggered_pop_group_modifier effects (like evopred species_empire_size_mult).
+    Static species trait modifiers (trait_docile, etc.) apply to all pops.
+
+    Returns: {planet_id: {species_id: {'triggered': int, 'non_triggered': int}}}
+    where 'triggered' = pops eligible for triggered modifiers,
+          'non_triggered' = pops in excluded categories (purge, assimilation, etc.)
+    """
+    owned_set = set(owned_planet_ids)
+    result = defaultdict(lambda: defaultdict(lambda: {'triggered': 0, 'non_triggered': 0}))
+
+    in_section = False
+    current_species = None
+    current_category = None
+    current_planet = None
+    current_size = None
+    in_key_block = False
+
+    for depth, line in stream_lines(gamestate_path):
+        if not in_section:
+            if depth == 0 and re.match(r'^pop_groups=', line):
+                in_section = True
+            continue
+
+        if depth == 0 and line not in ('{', '}'):
+            break
+
+        # Each pop_group entry at depth 1
+        if depth == 1 and line not in ('{', '}'):
+            # Finalize previous entry
+            if (current_planet is not None and current_species is not None
+                    and current_category is not None and current_size is not None
+                    and current_planet in owned_set):
+                bucket = ('non_triggered'
+                          if current_category in POP_CATEGORIES_NO_TRIGGERED_MODIFIERS
+                          else 'triggered')
+                result[current_planet][current_species][bucket] += current_size
+
+            current_species = None
+            current_category = None
+            current_planet = None
+            current_size = None
+            in_key_block = False
+            continue
+
+        # key= block at depth 2 contains species and category
+        if depth == 2 and re.match(r'^key=', line):
+            in_key_block = True
+            continue
+
+        if in_key_block and depth == 3:
+            m = re.match(r'^species=(\d+)', line)
+            if m:
+                current_species = int(m.group(1))
+            m = re.match(r'^category="([^"]+)"', line)
+            if m:
+                current_category = m.group(1)
+        elif in_key_block and depth <= 2 and line not in ('{', '}'):
+            in_key_block = False
+
+        # planet= and size= at depth 2
+        if depth == 2:
+            m = re.match(r'^planet=(\d+)', line)
+            if m:
+                current_planet = int(m.group(1))
+            m = re.match(r'^size=(\d+)', line)
+            if m:
+                current_size = int(m.group(1))
+
+    # Finalize last entry
+    if (current_planet is not None and current_species is not None
+            and current_category is not None and current_size is not None
+            and current_planet in owned_set):
+        bucket = ('non_triggered'
+                  if current_category in POP_CATEGORIES_NO_TRIGGERED_MODIFIERS
+                  else 'triggered')
+        result[current_planet][current_species][bucket] += current_size
+
+    return dict(result)
+
+
 def extract_district_levels(gamestate_path, district_ids):
     """
     Look up the level= field for each district ID in the global districts= section.
@@ -721,7 +839,9 @@ def extract_leader_data(gamestate_path, leader_ids):
     """
     Extract skill levels, class, and traits for specified leaders.
     Pass 6: iterates the leaders= section.
-    Returns: {leader_id: {'skill': int, 'class': str, 'traits': [str]}}
+    Returns: {leader_id: {'skill': int, 'level': int, 'bonus': int,
+                           'class': str, 'traits': [str]}}
+    skill = level + bonus (effective skill for governor scaling).
     """
     needed = set(leader_ids)
     if not needed:
@@ -743,9 +863,7 @@ def extract_leader_data(gamestate_path, leader_ids):
         if depth == 1 and line not in ('{', '}'):
             # New leader ID entry — finalize previous leader if any
             if current_id is not None and current_data is not None:
-                current_data['skill'] = current_data['_level'] + current_data['_bonus']
-                del current_data['_level']
-                del current_data['_bonus']
+                current_data['skill'] = current_data['level'] + current_data['bonus']
                 leaders[current_id] = current_data
                 current_id = None
                 current_data = None
@@ -757,8 +875,8 @@ def extract_leader_data(gamestate_path, leader_ids):
                 lid = int(m.group(1))
                 if lid in needed:
                     current_id = lid
-                    current_data = {'skill': 0, 'class': '', 'traits': [],
-                                    '_level': 0, '_bonus': 0}
+                    current_data = {'skill': 0, 'level': 0, 'bonus': 0,
+                                    'class': '', 'traits': []}
                 else:
                     current_id = None
             continue
@@ -772,10 +890,10 @@ def extract_leader_data(gamestate_path, leader_ids):
         if depth == 2:
             m = re.match(r'^level=(\d+)', line)
             if m:
-                current_data['_level'] = int(m.group(1))
+                current_data['level'] = int(m.group(1))
             m = re.match(r'^bonus_skill_level=(\d+)', line)
             if m:
-                current_data['_bonus'] = int(m.group(1))
+                current_data['bonus'] = int(m.group(1))
             m = re.match(r'^class="([^"]+)"', line)
             if m:
                 current_data['class'] = m.group(1)
@@ -785,9 +903,7 @@ def extract_leader_data(gamestate_path, leader_ids):
 
     # Finalize last leader if stream ended
     if current_id is not None and current_data is not None:
-        current_data['skill'] = current_data['_level'] + current_data['_bonus']
-        del current_data['_level']
-        del current_data['_bonus']
+        current_data['skill'] = current_data['level'] + current_data['bonus']
         leaders[current_id] = current_data
 
     return leaders
@@ -862,8 +978,11 @@ def build_planet_to_sector_map(gamestate_path, sector_data, planet_data):
     Build mapping from planet_id to sector info for governor effects.
     Pass 8: iterates galactic_object= to map planets → systems → sectors.
 
+    Maps ALL owned planets, including those in frontier systems (no sector).
+    Frontier planets get sector_id=None, is_sector_capital=False, sector_governor=None.
+
     Returns: {planet_id: {
-        'sector_id': int,
+        'sector_id': int|None,
         'is_sector_capital': bool,
         'sector_governor': int|None  (leader_id from the sector capital)
     }}
@@ -888,6 +1007,7 @@ def build_planet_to_sector_map(gamestate_path, sector_data, planet_data):
 
     # Parse galactic_object= to find which system each planet belongs to
     # Format: galactic_object= { 0= { planet=1569 planet=1570 ... } 1= { ... } }
+    # Maps ALL owned planets (not just those in sectors)
     planet_to_system = {}
     in_go = False
     current_sys_id = None
@@ -910,10 +1030,6 @@ def build_planet_to_sector_map(gamestate_path, sector_data, planet_data):
         if current_sys_id is None:
             continue
 
-        # Only process systems that are in our sectors
-        if current_sys_id not in system_to_sector:
-            continue
-
         # planet=<id> at depth 2 (individual entries, not a sub-block)
         if depth == 2:
             m = re.match(r'^planet=(\d+)', line)
@@ -922,21 +1038,27 @@ def build_planet_to_sector_map(gamestate_path, sector_data, planet_data):
                 if pid in owned_planet_ids:
                     planet_to_system[pid] = current_sys_id
 
-    # Build final mapping
+    # Build final mapping — include ALL owned planets
     result = {}
     for pid in owned_planet_ids:
         sys_id = planet_to_system.get(pid)
         if sys_id is None:
-            # Planet not found in any of our sectors' systems
+            # Planet not found in galactic_object (shouldn't happen)
             continue
         sec_id = system_to_sector.get(sys_id)
-        if sec_id is None:
-            continue
-        result[pid] = {
-            'sector_id': sec_id,
-            'is_sector_capital': pid in sector_capitals,
-            'sector_governor': sector_governor.get(sec_id),
-        }
+        if sec_id is not None:
+            result[pid] = {
+                'sector_id': sec_id,
+                'is_sector_capital': pid in sector_capitals,
+                'sector_governor': sector_governor.get(sec_id),
+            }
+        else:
+            # Frontier system — not assigned to any sector
+            result[pid] = {
+                'sector_id': None,
+                'is_sector_capital': False,
+                'sector_governor': None,
+            }
 
     return result
 
@@ -996,18 +1118,24 @@ def calculate_active_modifiers(country_data, species_data, pop_species):
             add(CIVIC_MODIFIERS[civic], f"civic: {civic}")
 
     # Per-species species_empire_size_mult
+    # species_mults: full mult (static traits + evopred) — for pops in triggered categories
+    # species_base_mults: static traits only — for pops in non-triggered categories
+    #   (purge, assimilation, etc. don't receive triggered_pop_group_modifier)
     species_mults = {}
+    species_base_mults = {}
     for sp_id in pop_species:
-        mult = 0.0
+        trait_mult = 0.0
+        evopred_mult = 0.0
         if sp_id in species_data:
             sp = species_data[sp_id]
-            # Trait-based mult
+            # Static trait modifiers (apply to ALL pops regardless of category)
             for trait in sp['traits']:
-                mult += TRAIT_SPECIES_EMPIRE_SIZE_MULT.get(trait, 0.0)
-            # EvoPred per-trait mult
+                trait_mult += TRAIT_SPECIES_EMPIRE_SIZE_MULT.get(trait, 0.0)
+            # EvoPred triggered modifier (only applies to triggered-eligible pops)
             evopred = sp.get('evopred_count', 0)
-            mult += EVOPRED_PER_TRAIT_MULT * evopred
-        species_mults[sp_id] = mult
+            evopred_mult = EVOPRED_PER_TRAIT_MULT * evopred
+        species_base_mults[sp_id] = trait_mult
+        species_mults[sp_id] = trait_mult + evopred_mult
 
     # Planetary ascension effect mult (from traditions + civics)
     asc_effect = 0.0
@@ -1023,7 +1151,9 @@ def calculate_active_modifiers(country_data, species_data, pop_species):
             asc_effect += val
             asc_effect_sources.append((f"civic: {civic}", val))
 
-    return {**mods, 'sources': sources, 'species_mults': species_mults,
+    return {**mods, 'sources': sources,
+            'species_mults': species_mults,
+            'species_base_mults': species_base_mults,
             'ascension_effect_mult': asc_effect,
             'ascension_effect_sources': asc_effect_sources}
 
@@ -1040,6 +1170,7 @@ def calculate_breakdown(
     species_data,           # for display labels
     leader_data,            # {leader_id: {'skill', 'class', 'traits'}}
     planet_sector_map,      # {pid: {'sector_id', 'is_sector_capital', 'sector_governor'}}
+    pop_category_data=None, # {pid: {sp_id: {'triggered': int, 'non_triggered': int}}}
 ):
     """
     Calculate empire size breakdown by component with per-planet modifiers.
@@ -1047,7 +1178,10 @@ def calculate_breakdown(
     Per-planet:
       ascension_factor = 1 - tier × BASE_REDUCTION × (1 + ascension_effect_mult)
       governor_pop_mult = GOVERNOR_RATE × skill_level  (pops only)
-      planet_pops = Σ(pops × BASE_pops × (1 + species_mult + governor_pop_mult)) × asc_factor
+      For each species on each planet:
+        triggered_pops get full species_mult (static traits + evopred)
+        non_triggered_pops get species_base_mult (static traits only)
+      planet_pops = Σ(per-species contributions) × asc_factor
       planet_districts = Σ(district_levels) × BASE_dist × asc_factor
       planet_colony = 1 × BASE_col × asc_factor
 
@@ -1057,7 +1191,8 @@ def calculate_breakdown(
       colonies_component = sum(planet_colony) × (1 + empire_size_colonies_mult)
       systems_component = total_systems × BASE_sys × (1 + empire_size_systems_mult)
     """
-    sm = modifiers['species_mults']
+    sm = modifiers['species_mults']          # full mult (trait + evopred)
+    sm_base = modifiers['species_base_mults']  # trait-only mult (no evopred)
     asc_effect_mult = modifiers['ascension_effect_mult']
 
     # Per-planet calculation
@@ -1071,7 +1206,16 @@ def calculate_breakdown(
     pops_detail = defaultdict(lambda: {'count': 0, 'species_mult': 0.0, 'raw_contribution': 0.0})
 
     # Governor and ascension summaries for reporting
-    governor_summary = {'planets_with_governor': 0, 'total_pops_reduction': 0.0}
+    governor_summary = {
+        'planets_with_governor': 0,
+        'total_pops_reduction': 0.0,
+        'planet_governors': 0,      # sector capitals with direct governor
+        'sector_governors': 0,      # non-capital planets with sector governor
+        'frontier_governors': 0,    # frontier planets with direct governor
+        'no_governor_sector': 0,    # sector planets without governor
+        'no_governor_frontier': 0,  # frontier planets without governor
+        'leaders': {},              # leader_id → {skill, level, bonus, class, planets_covered}
+    }
     ascension_summary = defaultdict(int)  # tier → count of planets
 
     planet_details = {}  # per-planet details for report
@@ -1090,12 +1234,27 @@ def calculate_breakdown(
         gov_skill = 0
         gov_type = None
 
+        is_frontier = sec_info.get('sector_id') is None
+
         if gov_id is not None and gov_id in leader_data:
-            # Planet has a direct governor (this is a sector capital)
+            # Planet has a direct governor (sector capital or frontier planet)
             gov_skill = leader_data[gov_id]['skill']
             gov_pop_mult = GOVERNOR_PLANET_RATE * gov_skill
-            gov_type = 'planet'
+            gov_type = 'planet' if not is_frontier else 'frontier_direct'
             governor_summary['planets_with_governor'] += 1
+            if is_frontier:
+                governor_summary['frontier_governors'] += 1
+            else:
+                governor_summary['planet_governors'] += 1
+            # Track leader usage
+            if gov_id not in governor_summary['leaders']:
+                ld = leader_data[gov_id]
+                governor_summary['leaders'][gov_id] = {
+                    'skill': ld['skill'], 'level': ld['level'],
+                    'bonus': ld['bonus'], 'class': ld['class'],
+                    'planets_covered': 0,
+                }
+            governor_summary['leaders'][gov_id]['planets_covered'] += 1
         elif sec_info.get('sector_governor') is not None:
             sec_gov_id = sec_info['sector_governor']
             if sec_gov_id in leader_data:
@@ -1103,22 +1262,53 @@ def calculate_breakdown(
                 gov_pop_mult = GOVERNOR_SECTOR_RATE * gov_skill
                 gov_type = 'sector'
                 governor_summary['planets_with_governor'] += 1
+                governor_summary['sector_governors'] += 1
+                if sec_gov_id not in governor_summary['leaders']:
+                    ld = leader_data[sec_gov_id]
+                    governor_summary['leaders'][sec_gov_id] = {
+                        'skill': ld['skill'], 'level': ld['level'],
+                        'bonus': ld['bonus'], 'class': ld['class'],
+                        'planets_covered': 0,
+                    }
+                governor_summary['leaders'][sec_gov_id]['planets_covered'] += 1
+        else:
+            if is_frontier:
+                governor_summary['no_governor_frontier'] += 1
+            else:
+                governor_summary['no_governor_sector'] += 1
 
         # Per-planet pops (with governor + ascension)
         planet_pops_raw = 0.0
         planet_pops_no_gov = 0.0
         planet_total_pop_count = 0
+        planet_cat = (pop_category_data or {}).get(pid, {})
         for sp_id, pop_count in pd['species_pops'].items():
-            sp_mult = sm.get(sp_id, 0.0)
+            full_mult = sm.get(sp_id, 0.0)
+            base_mult = sm_base.get(sp_id, 0.0)
+
+            # Split pops by category eligibility if pop_category_data available
+            cat_info = planet_cat.get(sp_id)
+            if cat_info is not None:
+                triggered_pops = cat_info['triggered']
+                non_triggered_pops = cat_info['non_triggered']
+            else:
+                # No category data: treat all pops as triggered (conservative)
+                triggered_pops = pop_count
+                non_triggered_pops = 0
+
             # Raw contribution (no governor, no ascension) for species reporting
-            raw = pop_count * BASE['pops'] * (1.0 + sp_mult)
+            raw = (triggered_pops * BASE['pops'] * (1.0 + full_mult)
+                   + non_triggered_pops * BASE['pops'] * (1.0 + base_mult))
             pops_detail[sp_id]['count'] += pop_count
-            pops_detail[sp_id]['species_mult'] = sp_mult
+            pops_detail[sp_id]['species_mult'] = full_mult
             pops_detail[sp_id]['raw_contribution'] += raw
+            pops_detail[sp_id].setdefault('non_triggered', 0)
+            pops_detail[sp_id]['non_triggered'] += non_triggered_pops
             total_pops_by_species[sp_id] += pop_count
 
             # With governor
-            with_gov = pop_count * BASE['pops'] * (1.0 + sp_mult + gov_pop_mult)
+            with_gov = (triggered_pops * BASE['pops'] * (1.0 + full_mult + gov_pop_mult)
+                        + non_triggered_pops * BASE['pops'] * (1.0 + base_mult + gov_pop_mult))
             planet_pops_raw += with_gov
             planet_pops_no_gov += raw
             planet_total_pop_count += pop_count
@@ -1250,10 +1440,36 @@ def print_report(breakdown, country_data, modifiers, species_data,
         print()
 
     gov = breakdown['governor_summary']
-    if gov['planets_with_governor'] > 0:
+    if gov['planets_with_governor'] > 0 or gov.get('no_governor_sector', 0) > 0:
         print("GOVERNOR EFFECTS:")
         print(f"    {gov['planets_with_governor']} planets with governor coverage")
+        if gov['planet_governors']:
+            print(f"      {gov['planet_governors']} sector capitals "
+                  f"(planet governor, {GOVERNOR_PLANET_RATE*100:+.0f}%/level)")
+        if gov['sector_governors']:
+            print(f"      {gov['sector_governors']} sector planets "
+                  f"(sector governor, {GOVERNOR_SECTOR_RATE*100:+.0f}%/level)")
+        if gov['frontier_governors']:
+            print(f"      {gov['frontier_governors']} frontier planets "
+                  f"(direct governor, {GOVERNOR_PLANET_RATE*100:+.0f}%/level)")
+        no_gov = gov.get('no_governor_sector', 0) + gov.get('no_governor_frontier', 0)
+        if no_gov:
+            parts = []
+            if gov.get('no_governor_sector', 0):
+                parts.append(f"{gov['no_governor_sector']} in sectors")
+            if gov.get('no_governor_frontier', 0):
+                parts.append(f"{gov['no_governor_frontier']} frontier")
+            print(f"    {no_gov} planets without governor ({', '.join(parts)})")
         print(f"    Total pops reduction from governors: {gov['total_pops_reduction']:.2f}")
+        if gov.get('leaders'):
+            print()
+            print("    Per-governor skill breakdown:")
+            for lid, linfo in sorted(gov['leaders'].items(),
+                                      key=lambda x: -x[1]['skill']):
+                print(f"      {linfo['class']:<11} {lid:>12}: "
+                      f"level {linfo['level']} + bonus {linfo['bonus']} "
+                      f"= skill {linfo['skill']}  "
+                      f"({linfo['planets_covered']} planet{'s' if linfo['planets_covered'] != 1 else ''})")
         print()
 
     # ── POPULATIONS ──
@@ -1264,14 +1480,18 @@ def print_report(breakdown, country_data, modifiers, species_data,
     print("  Per-species species_empire_size_mult:")
     for sp_id, det in sorted(breakdown['pops_detail'].items(),
                               key=lambda x: -x[1]['raw_contribution']):
-        traits_note = ""
+        notes = []
         if sp_id in species_data:
             evopred = species_data[sp_id].get('evopred_count', 0)
             if evopred:
-                traits_note = f"  [{evopred} evopred traits]"
+                notes.append(f"{evopred} evopred traits")
+        non_trig = det.get('non_triggered', 0)
+        if non_trig:
+            notes.append(f"{non_trig:,} in purge/etc (no triggered mults)")
+        note_str = f"  [{', '.join(notes)}]" if notes else ""
         print(f"    species {sp_id}: {det['count']:>8,} pops  "
               f"mult={pct(det['species_mult'])}  "
-              f"raw={det['raw_contribution']:7.2f}{traits_note}")
+              f"raw={det['raw_contribution']:7.2f}{note_str}")
     print(f"  Raw pops (species mults only):          {breakdown['pops_raw']:.2f}")
     print(f"  After governor + ascension:             {breakdown['pops_after_planet_mods']:.2f}")
     print()
@@ -1343,19 +1563,6 @@ def print_report(breakdown, country_data, modifiers, species_data,
                 ('Colonies', breakdown['colonies_component']),
             ]:
                 print(f"     {comp:<12} {calc_val:>10.1f}")
-    print()
-
-    # ── GROWING PAINS ──
-    neg_pct = max(0.1, min(1.0, 1.1 - 0.001 * round(es)))
-    threshold = 1000
-    gap = round(es) - threshold
-    print(f"  negative_empire_size_percent = max(0.1, 1.1 - 0.001 × {round(es)}) = {neg_pct:.3f}")
-    if gap > 0:
-        print(f"  Growing Pains floor threshold: empire_size < {threshold}")
-        print(f"  Current gap to threshold:      +{gap} points")
-        print(f"  (Progress multiplier stuck at 0.1 minimum until gap is closed)")
-    else:
-        print(f"  ✓ Empire size below {threshold} — Growing Pains progress multiplier > 0.1")
     print(SEP)
 
 
@@ -1368,22 +1575,55 @@ def main():
         print(__doc__)
         sys.exit(1)
 
-    save_folder = Path(sys.argv[1])
+    save_path = Path(sys.argv[1])
     country_id = int(sys.argv[2]) if len(sys.argv) > 2 else DEFAULT_COUNTRY_ID
-    gamestate = save_folder / 'gamestate'
 
-    if not gamestate.exists():
-        print(f"Error: {gamestate} not found")
+    # Resolve gamestate path — handle .sav (ZIP) or folder with gamestate
+    tmp_dir = None
+    if save_path.is_file() and save_path.suffix == '.sav':
+        # Extract gamestate from .sav ZIP archive to a temp directory
+        if not zipfile.is_zipfile(save_path):
+            print(f"Error: {save_path} is not a valid ZIP archive")
+            sys.exit(1)
+        tmp_dir = tempfile.mkdtemp(prefix='stellaris_es_')
+        with zipfile.ZipFile(save_path, 'r') as zf:
+            if 'gamestate' not in zf.namelist():
+                print(f"Error: {save_path} does not contain a 'gamestate' file")
+                shutil.rmtree(tmp_dir)
+                sys.exit(1)
+            zf.extract('gamestate', tmp_dir)
+        gamestate = Path(tmp_dir) / 'gamestate'
+        print(f"Parsing: {save_path}  (country {country_id})")
+    elif save_path.is_dir():
+        gamestate = save_path / 'gamestate'
+        if not gamestate.exists():
+            print(f"Error: {gamestate} not found")
+            sys.exit(1)
+        print(f"Parsing: {gamestate}  (country {country_id})")
+    elif save_path.is_file():
+        # Assume it's a gamestate file directly
+        gamestate = save_path
+        print(f"Parsing: {gamestate}  (country {country_id})")
+    else:
+        print(f"Error: {save_path} not found")
         sys.exit(1)
 
     gs = str(gamestate)
-    print(f"Parsing: {gamestate}  (country {country_id})")
 
-    print("Pass 1/8: species data ...")
+    try:
+        _run_analysis(gs, country_id)
+    finally:
+        if tmp_dir is not None:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
+
+def _run_analysis(gs, country_id):
+    """Run the full 9-pass analysis on a gamestate file path."""
+    print("Pass 1/9: species data ...")
     species_data = extract_species_data(gs)
     print(f"  → {len(species_data)} species loaded")
 
-    print("Pass 2/8: country data ...")
+    print("Pass 2/9: country data ...")
     country_data = extract_country_data(gs, country_id)
     print(f"  → {len(country_data['traditions'])} traditions, "
           f"{len(country_data['technologies'])} techs, "
@@ -1391,7 +1631,7 @@ def main():
           f"{len(country_data['civics'])} civics, "
           f"{len(country_data['owned_planets'])} owned planets")
 
-    print("Pass 3/8: planet data ...")
+    print("Pass 3/9: planet data ...")
     planet_data = extract_planet_data(gs, country_data['owned_planets'])
     all_district_ids = []
     total_pops_by_species = defaultdict(float)
@@ -1408,7 +1648,19 @@ def main():
           f"{sum(total_pops_by_species.values()):.0f} pops, "
           f"ascension: {asc_note or 'none'}")
 
-    print("Pass 4/8: district levels ...")
+    print("Pass 4/9: pop categories ...")
+    pop_category_data = extract_pop_category_data(gs, country_data['owned_planets'])
+    total_triggered = sum(
+        cat['triggered'] for by_sp in pop_category_data.values()
+        for cat in by_sp.values())
+    total_non_triggered = sum(
+        cat['non_triggered'] for by_sp in pop_category_data.values()
+        for cat in by_sp.values())
+    print(f"  → {total_triggered + total_non_triggered} pops categorized "
+          f"({total_triggered} in triggered categories, "
+          f"{total_non_triggered} in excluded categories)")
+
+    print("Pass 5/9: district levels ...")
     district_levels = extract_district_levels(gs, all_district_ids)
     total_district_levels = sum(district_levels.values())
     missing_districts = len(all_district_ids) - len(district_levels)
@@ -1418,7 +1670,7 @@ def main():
         print(f"  ⚠ {missing_districts} district IDs not found in districts= section")
 
     owned_fleets = country_data.get('owned_fleets', [])
-    print(f"Pass 5/8: owned systems ({len(owned_fleets)} owned fleets) ...")
+    print(f"Pass 6/9: owned systems ({len(owned_fleets)} owned fleets) ...")
     total_systems, systems_total_matched, systems_excluded = count_owned_systems(gs, owned_fleets)
     print(f"  → {total_systems} owned systems "
           f"({systems_total_matched} matched, {systems_excluded} excluded)")
@@ -1429,12 +1681,12 @@ def main():
         if pd.get('governor') is not None:
             governor_ids.add(pd['governor'])
 
-    print("Pass 6/8: leader data ...")
+    print("Pass 7/9: leader data ...")
     leader_data = extract_leader_data(gs, governor_ids)
     print(f"  → {len(leader_data)} leaders loaded "
           f"(skills: {', '.join(str(ld['skill']) for ld in leader_data.values()) or 'none'})")
 
-    print("Pass 7/8: sector data ...")
+    print("Pass 8/9: sector data ...")
     sector_data = extract_sector_data(gs, country_id)
     # Collect sector governor IDs (from capital planets' governor field)
     for sec in sector_data.values():
@@ -1452,10 +1704,17 @@ def main():
     else:
         print(f"  → {len(sector_data)} sectors")
 
-    print("Pass 8/8: galactic objects (planet→sector map) ...")
+    print("Pass 9/9: galactic objects (planet→sector map) ...")
     planet_sector_map = build_planet_to_sector_map(gs, sector_data, planet_data)
-    mapped = sum(1 for p in planet_data if p in planet_sector_map)
-    print(f"  → {mapped}/{len(planet_data)} planets mapped to sectors")
+    in_sectors = sum(1 for p in planet_sector_map.values() if p['sector_id'] is not None)
+    in_frontier = sum(1 for p in planet_sector_map.values() if p['sector_id'] is None)
+    with_sec_gov = sum(1 for p in planet_sector_map.values()
+                       if p['sector_id'] is not None and p['sector_governor'] is not None)
+    frontier_direct = sum(1 for pid, p in planet_sector_map.items()
+                          if p['sector_id'] is None
+                          and planet_data[pid].get('governor') is not None)
+    print(f"  → {in_sectors} planets in sectors ({with_sec_gov} with governor), "
+          f"{in_frontier} in frontier systems ({frontier_direct} with direct governor)")
 
     print()
     modifiers = calculate_active_modifiers(
@@ -1463,7 +1722,8 @@ def main():
 
     breakdown = calculate_breakdown(
         planet_data, district_levels, total_systems,
-        modifiers, species_data, leader_data, planet_sector_map
+        modifiers, species_data, leader_data, planet_sector_map,
+        pop_category_data
     )
 
     print_report(

@@ -2,30 +2,20 @@
 
 A Python script that parses a Stellaris 4.3 save game and calculates the exact empire size breakdown by component, annotated with every active modifier from traditions, technologies, ascension perks, governors, and planet ascension tiers.
 
-**Accuracy: -0.2%** (1479 calculated vs 1482 game-reported on test save).
-
-## Background
-
-Developed to diagnose a bug in Stellaris 4.3 Cetus Open Beta (checksum `3f25`) where the **Chimeral Consciousness** authority (Evolutionary Predators + Hive Mind + Mutation tradition tree) fails to apply its `-1% Empire Size from Pops per Species Trait` bonus to any Hive Mind pop. The root cause and fix are documented in full here:
-
-- **Bug report:** `chimeral_consciousness_growing_pains_bug.md` (Obsidian note)
-- **Fix mod:** [`chimeral_consciousness_fix`](../../Mods/chimeral_consciousness_fix/) — adds the missing `triggered_pop_group_modifier` to `social_classes_triggered_modifiers_no_happiness.txt`
+**Accuracy: -0.1%** (1481 calculated vs 1482 game-reported on test save).
 
 ## Usage
 
 ```bash
-python3 empire_size.py <save_folder> [country_id]
+python3 empire_size.py <save_path> [country_id]
 ```
 
-The save folder must contain an unzipped `gamestate` file (Stellaris saves are zipped `.sav` archives; unzip first).
+Accepts a `.sav` file (ZIP archive) or a folder containing an unzipped `gamestate` file.
 
 ```bash
-# Unzip your save first
-unzip "My Save.sav" -d my_save/
-
-# Then run the calculator
-python3 empire_size.py my_save/
-python3 empire_size.py my_save/ 0        # explicit country ID (default: 0 = player)
+python3 empire_size.py saves/my_save.sav
+python3 empire_size.py saves/my_save.sav 0     # explicit country ID (default: 0 = player)
+python3 empire_size.py saves/q2/               # folder with gamestate
 ```
 
 ### Example Output
@@ -44,20 +34,25 @@ PLANET ASCENSION TIERS:
 
 GOVERNOR EFFECTS:
     26 planets with governor coverage
+      16 sector capitals (planet governor, -2%/level)
+      9 sector planets (sector governor, -1%/level)
+      1 frontier planets (direct governor, -2%/level)
+    18 planets without governor (4 in sectors, 14 frontier)
     Total pops reduction from governors: 94.39
 
 POPULATIONS  [172,999 pops]
   Base:  172,999 × 0.005 = 865.00
   Per-species species_empire_size_mult:
     species 609:  166,826 pops  mult=-38.0%  raw= 517.16  [38 evopred traits]
+    species 16777235:    3,500 pops  mult=-6.0%  raw=  17.50  [6 evopred traits, 3,500 in purge/etc]
     ...
-  Raw pops (species mults only):          546.03
-  After governor + ascension:             398.80
+  Raw pops (species mults only):          548.03
+  After governor + ascension:             400.80
   empire_size_pops_mult = -15.0%:
     tradition: tr_domination_finish               -5.0%
     tradition: tr_synchronicity_kinship_gestalt   -5.0%
     tech: tech_psionic_theory                     -5.0%
-  POPS COMPONENT: 398.80 × (1 -15.0%) = 339.0
+  POPS COMPONENT: 400.80 × (1 -15.0%) = 340.7
 
 DISTRICTS  [777 total district levels across all owned planets]
   Base:  777 × 0.5 = 388.5
@@ -73,9 +68,9 @@ COLONIES  [44 owned planets]
   After ascension:                        820.0
   COLONIES COMPONENT: 820.0 × (1 -40.0%) = 492.0
 
-CALCULATED EMPIRE SIZE:         1479.18  →  1479
+CALCULATED EMPIRE SIZE:         1480.79  →  1481
 GAME-REPORTED EMPIRE SIZE:      1482
-DISCREPANCY:                    -2.82  (-0.2%)
+DISCREPANCY:                    -1.21  (-0.1%)
 ═════════════════════════════════════════════════════════════════
 ```
 
@@ -87,39 +82,35 @@ All game constants and modifier lookup tables are in the `SETTINGS` block at the
 
 | Setting | Default | Description |
 |---------|---------|-------------|
-| `EVOPRED_PER_TRAIT_MULT` | `-0.01` | EvoPred `-1%/trait` modifier. Set to `0.0` to simulate vanilla (bugged) behaviour |
+| `EVOPRED_PER_TRAIT_MULT` | `-0.01` | EvoPred `-1%/trait` modifier. Set to `0.0` if not applicable |
 | `ASCENSION_TIER_BASE_REDUCTION` | `0.05` | -5% per planet ascension tier to pops/districts/colony |
 | `GOVERNOR_PLANET_RATE` | `-0.02` | Per-skill-level empire size mult for planet governors (sector capital) |
 | `GOVERNOR_SECTOR_RATE` | `-0.01` | Per-skill-level empire size mult for sector governors (other planets) |
 | `SYSTEM_STARBASE_LEVELS` | set of 5 | Starbase levels that count as systems (outpost through citadel) |
+| `POP_CATEGORIES_NO_TRIGGERED_MODIFIERS` | set of 9 | Pop categories excluded from triggered modifiers (purge, assimilation, etc.) |
 | `TRADITION_MODIFIERS` | (see file) | Maps tradition keys → empire_size modifier contributions |
 | `TECH_MODIFIERS` | (see file) | Maps technology keys → empire_size modifier contributions |
 | `ASCENSION_PERK_MODIFIERS` | (see file) | Maps ascension perk keys → contributions |
 | `ASCENSION_EFFECT_TRADITIONS` | (see file) | Traditions giving `planetary_ascension_effect_mult` |
 | `ASCENSION_EFFECT_CIVICS` | (see file) | Civics giving `planetary_ascension_effect_mult` |
 
-### Simulating vanilla (mod OFF)
-
-```python
-EVOPRED_PER_TRAIT_MULT = 0.0   # bug present: modifier never fires for hive mind drones
-```
-
 ## How It Works
 
 ### Save game format
 
-Stellaris saves use the **Clausewitz PDX text format**. The script streams the `gamestate` file in 8 targeted passes:
+Stellaris saves use the **Clausewitz PDX text format**. The script streams the `gamestate` file in 9 targeted passes:
 
 | Pass | Section | What it extracts |
 |------|---------|-----------------|
 | 1 | `species_db=` | Species traits and `species_traits_evopred_count` variables |
 | 2 | `country=` | Traditions, techs, perks, civics, owned planets, owned fleets, empire_size |
 | 3 | `planets=` | District IDs, pop counts per species, ascension tier, governor ID per planet |
-| 4 | `districts=` | Level (stacked count) for each district ID |
-| 5 | `starbase_mgr=` + `ships=` | Fleet-based system count with starbase level filtering |
-| 6 | `leaders=` | Skill level, class, and traits for governor leaders |
-| 7 | `sectors=` | Sector capitals, system lists, and owner for sector→governor mapping |
-| 8 | `galactic_object=` | Planet→system→sector chain for governor coverage |
+| 4 | `pop_groups=` | Per-(planet, species) pop counts split by category eligibility |
+| 5 | `districts=` | Level (stacked count) for each district ID |
+| 6 | `starbase_mgr=` + `ships=` | Fleet-based system count with starbase level filtering |
+| 7 | `leaders=` | Skill level, class, and traits for governor leaders |
+| 8 | `sectors=` | Sector capitals, system lists, and owner for sector→governor mapping |
+| 9 | `galactic_object=` | Planet→system→sector chain for governor coverage |
 
 ### Empire size formula
 
@@ -129,6 +120,8 @@ for each planet:
     asc_factor = 1 - tier × 0.05 × (1 + planetary_ascension_effect_mult)
     gov_pop_mult = governor_rate × governor_skill   (−0.02/level planet, −0.01/level sector)
 
+    # Pops in triggered categories get full species_mult (trait + evopred)
+    # Pops in excluded categories (purge, assimilation, etc.) get base mult (trait only)
     planet_pops = Σ(pops × 0.005 × (1 + species_mult + gov_pop_mult)) × asc_factor
     planet_districts = district_levels × 0.5 × asc_factor
     planet_colony = 1 × 20.0 × asc_factor
@@ -149,14 +142,9 @@ empire_size = (pops + districts + systems + colonies) × (1 + empire_size_mult)
 
 Systems are counted via a fleet-based ownership chain: `starbase_mgr` → `station=ship_id` → ship's `fleet=fleet_id` → check fleet_id against country's `owned_fleets`. Only starbases with level in `SYSTEM_STARBASE_LEVELS` are counted (orbital rings and deep space citadels are excluded).
 
-### Growing Pains situation
+### Pop category filtering
 
-The script calculates the `negative_empire_size_percent` multiplier (used by the Behemoth crisis situation's monthly progress formula) and shows how far empire size is from the threshold where progress improves:
-
-```
-negative_empire_size_percent = max(0.1, 1.1 - 0.001 × empire_size)
-Threshold for improvement: empire_size < 1100
-```
+Pops in certain categories (purge, assimilation, criminal, etc.) do not receive `triggered_pop_group_modifier` effects like the EvoPred `species_empire_size_mult`. The script reads `pop_groups=` to determine each pop's category and applies triggered modifiers only to eligible pops. Static species trait modifiers (`trait_docile`, `trait_unruly`) apply to all pops regardless of category.
 
 ## Adding New Modifier Sources
 
