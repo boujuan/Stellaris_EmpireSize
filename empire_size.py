@@ -200,6 +200,39 @@ POP_CATEGORIES_NO_TRIGGERED_MODIFIERS = {
 
 
 # ================================================================
+# TERMINAL COLORS
+# ================================================================
+
+import os as _os
+
+_NO_COLOR = _os.environ.get('NO_COLOR') is not None or not _os.isatty(1)
+
+def _c(code, text):
+    """Wrap text in ANSI escape code. No-op when color is disabled."""
+    if _NO_COLOR:
+        return str(text)
+    return f"\033[{code}m{text}\033[0m"
+
+# Semantic helpers
+def _bold(t):       return _c('1', t)
+def _dim(t):        return _c('2', t)
+def _red(t):        return _c('91', t)
+def _green(t):      return _c('92', t)
+def _yellow(t):     return _c('93', t)
+def _blue(t):       return _c('94', t)
+def _magenta(t):    return _c('95', t)
+def _cyan(t):       return _c('96', t)
+def _white(t):      return _c('97', t)
+def _bold_cyan(t):  return _c('1;96', t)
+def _bold_green(t): return _c('1;92', t)
+def _bold_red(t):   return _c('1;91', t)
+def _bold_yellow(t):return _c('1;93', t)
+def _bold_blue(t):  return _c('1;94', t)
+def _bold_mag(t):   return _c('1;95', t)
+def _bold_white(t): return _c('1;97', t)
+
+
+# ================================================================
 # PDX STREAMING PARSER
 # ================================================================
 
@@ -1399,59 +1432,67 @@ def calculate_breakdown(
 def print_report(breakdown, country_data, modifiers, species_data,
                  total_systems, systems_total_matched, systems_excluded,
                  game_reported=None):
-    """Print formatted empire size breakdown report."""
+    """Print formatted empire size breakdown report with terminal colors."""
     W = 65
-    SEP = '═' * W
+    SEP = _bold_cyan('═' * W)
 
-    def pct(v):
+    def pct(v, color=True):
+        s = f"{v*100:+.1f}%"
+        if not color:
+            return s
+        return _green(s) if v < 0 else _red(s) if v > 0 else _dim(s)
+
+    def pct_raw(v):
+        """Plain percentage without color (for embedding in colored strings)."""
         return f"{v*100:+.1f}%"
 
     def fmt_sources(src_list):
         if not src_list:
-            return "    (none)"
+            return f"    {_dim('(none)')}"
         lines = []
         for name, val in src_list:
-            lines.append(f"    {name:<45} {pct(val)}")
+            lines.append(f"    {_dim(f'{name:<45}')} {pct(val)}")
         return '\n'.join(lines)
 
     es = breakdown['empire_size']
     game = game_reported or country_data.get('empire_size')
 
+    print()
     print(SEP)
-    print(f" EMPIRE SIZE BREAKDOWN — Country {DEFAULT_COUNTRY_ID}: {country_data['name']}")
+    print(_bold_cyan(f" 🏛️  EMPIRE SIZE BREAKDOWN — Country {DEFAULT_COUNTRY_ID}: {country_data['name']}"))
     print(SEP)
     print()
 
     # ── PLANET MODIFIERS SUMMARY ──
     asc = breakdown['ascension_summary']
     if any(t > 0 for t in asc):
-        print("PLANET ASCENSION TIERS:")
+        print(_bold_mag("⬆️  PLANET ASCENSION TIERS"))
         asc_eff = breakdown['ascension_effect_mult']
         for tier in sorted(asc.keys()):
             if tier == 0:
                 continue
             reduction = tier * ASCENSION_TIER_BASE_REDUCTION * (1.0 + asc_eff)
-            print(f"    Tier {tier}: {asc[tier]} planets  "
-                  f"(−{reduction*100:.1f}% to pops/districts/colony)")
+            print(f"    {_magenta(f'Tier {tier}')}: {_white(asc[tier])} planets  "
+                  f"({_green(f'−{reduction*100:.1f}%')} to pops/districts/colony)")
         if asc.get(0, 0) > 0:
-            print(f"    Tier 0: {asc[0]} planets  (no reduction)")
+            print(f"    {_dim(f'Tier 0')}: {asc[0]} planets  {_dim('(no reduction)')}")
         print(f"  planetary_ascension_effect_mult = {pct(asc_eff)}:")
         print(fmt_sources(modifiers['ascension_effect_sources']))
         print()
 
     gov = breakdown['governor_summary']
     if gov['planets_with_governor'] > 0 or gov.get('no_governor_sector', 0) > 0:
-        print("GOVERNOR EFFECTS:")
-        print(f"    {gov['planets_with_governor']} planets with governor coverage")
+        print(_bold_blue("👔 GOVERNOR EFFECTS"))
+        print(f"    {_bold_white(gov['planets_with_governor'])} planets with governor coverage")
         if gov['planet_governors']:
-            print(f"      {gov['planet_governors']} sector capitals "
-                  f"(planet governor, {GOVERNOR_PLANET_RATE*100:+.0f}%/level)")
+            print(f"      {_cyan(gov['planet_governors'])} sector capitals "
+                  f"{_dim(f'(planet governor, {GOVERNOR_PLANET_RATE*100:+.0f}%/level)')}")
         if gov['sector_governors']:
-            print(f"      {gov['sector_governors']} sector planets "
-                  f"(sector governor, {GOVERNOR_SECTOR_RATE*100:+.0f}%/level)")
+            print(f"      {_cyan(gov['sector_governors'])} sector planets "
+                  f"{_dim(f'(sector governor, {GOVERNOR_SECTOR_RATE*100:+.0f}%/level)')}")
         if gov['frontier_governors']:
-            print(f"      {gov['frontier_governors']} frontier planets "
-                  f"(direct governor, {GOVERNOR_PLANET_RATE*100:+.0f}%/level)")
+            print(f"      {_cyan(gov['frontier_governors'])} frontier planets "
+                  f"{_dim(f'(direct governor, {GOVERNOR_PLANET_RATE*100:+.0f}%/level)')}")
         no_gov = gov.get('no_governor_sector', 0) + gov.get('no_governor_frontier', 0)
         if no_gov:
             parts = []
@@ -1459,103 +1500,108 @@ def print_report(breakdown, country_data, modifiers, species_data,
                 parts.append(f"{gov['no_governor_sector']} in sectors")
             if gov.get('no_governor_frontier', 0):
                 parts.append(f"{gov['no_governor_frontier']} frontier")
-            print(f"    {no_gov} planets without governor ({', '.join(parts)})")
-        print(f"    Total pops reduction from governors: {gov['total_pops_reduction']:.2f}")
+            print(f"    {_yellow(no_gov)} planets without governor {_dim(f'({', '.join(parts)})')}")
+        print(f"    Total pops reduction: {_green(f'{gov['total_pops_reduction']:.2f}')}")
         if gov.get('leaders'):
             print()
-            print("    Per-governor skill breakdown:")
+            print(f"    {_dim('Per-governor skill breakdown:')}")
             for lid, linfo in sorted(gov['leaders'].items(),
                                       key=lambda x: -x[1]['skill']):
-                print(f"      {linfo['class']:<11} {lid:>12}: "
+                skill_color = _bold_green if linfo['skill'] >= 7 else _cyan if linfo['skill'] >= 5 else _yellow
+                print(f"      {_dim(f'{linfo['class']:<11}')} {_dim(f'{lid:>12}')}: "
                       f"level {linfo['level']} + bonus {linfo['bonus']} "
-                      f"= skill {linfo['skill']}  "
-                      f"({linfo['planets_covered']} planet{'s' if linfo['planets_covered'] != 1 else ''})")
+                      f"= {skill_color(f'skill {linfo['skill']}')}  "
+                      f"{_dim(f'({linfo['planets_covered']} planet{'s' if linfo['planets_covered'] != 1 else ''})')}")
         print()
 
     # ── POPULATIONS ──
     total_pops = sum(d['count'] for d in breakdown['pops_detail'].values())
-    print(f"POPULATIONS  [{total_pops:,} pops]")
-    print(f"  Base:  {total_pops:,} × {BASE['pops']} = {total_pops * BASE['pops']:.2f}")
+    print(_bold_yellow(f"👥 POPULATIONS") + f"  [{_bold_white(f'{total_pops:,}')} pops]")
+    print(f"  Base:  {total_pops:,} × {BASE['pops']} = {_white(f'{total_pops * BASE['pops']:.2f}')}")
     print()
-    print("  Per-species species_empire_size_mult:")
+    print(f"  {_dim('Per-species species_empire_size_mult:')}")
     for sp_id, det in sorted(breakdown['pops_detail'].items(),
                               key=lambda x: -x[1]['raw_contribution']):
         notes = []
         if sp_id in species_data:
             evopred = species_data[sp_id].get('evopred_count', 0)
             if evopred:
-                notes.append(f"{evopred} evopred traits")
+                notes.append(f"🧬 {evopred} evopred")
         non_trig = det.get('non_triggered', 0)
         if non_trig:
-            notes.append(f"{non_trig:,} in purge/etc (no triggered mults)")
-        note_str = f"  [{', '.join(notes)}]" if notes else ""
-        print(f"    species {sp_id}: {det['count']:>8,} pops  "
+            notes.append(f"☠️  {non_trig:,} purge/etc")
+        note_str = f"  {_dim('[' + ', '.join(notes) + ']')}" if notes else ""
+        print(f"    species {_cyan(sp_id)}: {_white(f'{det['count']:>8,}')} pops  "
               f"mult={pct(det['species_mult'])}  "
-              f"raw={det['raw_contribution']:7.2f}{note_str}")
-    print(f"  Raw pops (species mults only):          {breakdown['pops_raw']:.2f}")
-    print(f"  After governor + ascension:             {breakdown['pops_after_planet_mods']:.2f}")
+              f"raw={_white(f'{det['raw_contribution']:7.2f}')}{note_str}")
+    print(f"  Raw pops (species mults only):          {_white(f'{breakdown['pops_raw']:.2f}')}")
+    print(f"  After governor + ascension:             {_white(f'{breakdown['pops_after_planet_mods']:.2f}')}")
     print()
     print(f"  empire_size_pops_mult = {pct(breakdown['pops_mult'])}:")
     print(fmt_sources(modifiers['sources']['pops']))
-    print(f"  POPS COMPONENT: {breakdown['pops_after_planet_mods']:.2f}"
-          f" × (1 {pct(breakdown['pops_mult'])})"
-          f" = {breakdown['pops_component']:.1f}")
+    print(f"  {_bold_yellow('POPS')}: {breakdown['pops_after_planet_mods']:.2f}"
+          f" × (1 {pct_raw(breakdown['pops_mult'])}) = {_bold_white(f'{breakdown['pops_component']:.1f}')}")
     print()
 
     # ── DISTRICTS ──
     total_dl = breakdown['total_district_levels']
-    print(f"DISTRICTS  [{total_dl} total district levels across all owned planets]")
-    print(f"  Base:  {total_dl} × {BASE['districts']} = {breakdown['districts_raw']:.1f}")
-    print(f"  After ascension:                        {breakdown['districts_after_planet_mods']:.1f}")
+    print(_bold_green(f"🏗️  DISTRICTS") + f"  [{_bold_white(total_dl)} total levels]")
+    print(f"  Base:  {total_dl} × {BASE['districts']} = {_white(f'{breakdown['districts_raw']:.1f}')}")
+    print(f"  After ascension:                        {_white(f'{breakdown['districts_after_planet_mods']:.1f}')}")
     print(f"  empire_size_districts_mult = {pct(breakdown['districts_mult'])}:")
     print(fmt_sources(modifiers['sources']['districts']))
-    print(f"  DISTRICTS COMPONENT: {breakdown['districts_after_planet_mods']:.1f}"
-          f" × (1 {pct(breakdown['districts_mult'])})"
-          f" = {breakdown['districts_component']:.1f}")
+    print(f"  {_bold_green('DISTRICTS')}: {breakdown['districts_after_planet_mods']:.1f}"
+          f" × (1 {pct_raw(breakdown['districts_mult'])}) = {_bold_white(f'{breakdown['districts_component']:.1f}')}")
     print()
 
     # ── SYSTEMS ──
-    print(f"SYSTEMS  [{total_systems} owned systems]")
+    print(_bold_blue(f"🌌 SYSTEMS") + f"  [{_bold_white(total_systems)} owned]")
     if systems_excluded > 0:
-        print(f"  Starbases matched by fleet: {systems_total_matched}  "
-              f"(excluded {systems_excluded} orbital rings/DSCs)")
-    print(f"  Base:  {total_systems} × {BASE['systems']} = {float(total_systems):.1f}")
+        print(f"  Starbases matched: {_white(systems_total_matched)}  "
+              f"{_dim(f'(excluded {systems_excluded} orbital rings/DSCs)')}")
+    print(f"  Base:  {total_systems} × {BASE['systems']} = {_white(f'{float(total_systems):.1f}')}")
     print(f"  empire_size_systems_mult = {pct(breakdown['systems_mult'])}:")
     print(fmt_sources(modifiers['sources']['systems']))
-    print(f"  SYSTEMS COMPONENT: {breakdown['systems_component']:.1f}")
+    print(f"  {_bold_blue('SYSTEMS')}: {_bold_white(f'{breakdown['systems_component']:.1f}')}")
     print()
 
     # ── COLONIES ──
     n_col = len(country_data['owned_planets'])
-    print(f"COLONIES  [{n_col} owned planets]")
-    print(f"  Base:  {n_col} × {BASE['colonies']} = {breakdown['colonies_raw']:.1f}")
-    print(f"  After ascension:                        {breakdown['colonies_after_planet_mods']:.1f}")
+    print(_bold_mag(f"🪐 COLONIES") + f"  [{_bold_white(n_col)} planets]")
+    print(f"  Base:  {n_col} × {BASE['colonies']} = {_white(f'{breakdown['colonies_raw']:.1f}')}")
+    print(f"  After ascension:                        {_white(f'{breakdown['colonies_after_planet_mods']:.1f}')}")
     print(f"  empire_size_colonies_mult = {pct(breakdown['colonies_mult'])}:")
     print(fmt_sources(modifiers['sources']['colonies']))
-    print(f"  COLONIES COMPONENT: {breakdown['colonies_after_planet_mods']:.1f}"
-          f" × (1 {pct(breakdown['colonies_mult'])})"
-          f" = {breakdown['colonies_component']:.1f}")
+    print(f"  {_bold_mag('COLONIES')}: {breakdown['colonies_after_planet_mods']:.1f}"
+          f" × (1 {pct_raw(breakdown['colonies_mult'])}) = {_bold_white(f'{breakdown['colonies_component']:.1f}')}")
     print()
 
     # ── GLOBAL MULT ──
-    print(f"GLOBAL empire_size_mult = {pct(breakdown['total_mult'])}:")
+    print(f"🌐 {_bold('GLOBAL')} empire_size_mult = {pct(breakdown['total_mult'])}:")
     print(fmt_sources(modifiers['sources']['total']))
     print()
 
     # ── TOTALS ──
     print(SEP)
-    print(f"  Subtotal (before global mult):  {breakdown['subtotal']:.2f}")
-    print(f"  × (1 {pct(breakdown['total_mult'])}) = {breakdown['total_mult']+1:.3f}")
-    print(f"  CALCULATED EMPIRE SIZE:         {es:.2f}  →  {round(es)}")
+    print(f"  Subtotal (before global mult):  {_white(f'{breakdown['subtotal']:.2f}')}")
+    print(f"  × (1 {pct_raw(breakdown['total_mult'])}) = {breakdown['total_mult']+1:.3f}")
+    print(f"  📊 {_bold('CALCULATED EMPIRE SIZE')}:    {_bold_white(f'{es:.2f}')}  →  {_bold_cyan(round(es))}")
     if game is not None:
         diff = es - game
-        print(f"  GAME-REPORTED EMPIRE SIZE:      {game}")
-        print(f"  DISCREPANCY:                    {diff:+.2f}  ({diff/game*100:+.1f}%)")
+        diff_pct = diff / game * 100
+        print(f"  🎮 {_bold('GAME-REPORTED')}:              {_bold_white(game)}")
+        if abs(diff_pct) <= 0.5:
+            disc_color = _bold_green
+        elif abs(diff_pct) <= 2.0:
+            disc_color = _bold_yellow
+        else:
+            disc_color = _bold_red
+        print(f"  📏 {_bold('DISCREPANCY')}:                {disc_color(f'{diff:+.2f}')}  ({disc_color(f'{diff_pct:+.1f}%')})")
         if abs(diff) > 2:
             print()
-            print("  Per-component comparison:")
-            print(f"     {'Component':<12} {'Calculated':>12}")
-            print(f"     {'-'*30}")
+            print(f"  {_dim('Per-component comparison:')}")
+            print(f"     {_dim(f'{'Component':<12} {'Calculated':>12}')}")
+            print(f"     {_dim('-'*30)}")
             for comp, calc_val in [
                 ('Pops', breakdown['pops_component']),
                 ('Districts', breakdown['districts_component']),
@@ -1564,6 +1610,7 @@ def print_report(breakdown, country_data, modifiers, species_data,
             ]:
                 print(f"     {comp:<12} {calc_val:>10.1f}")
     print(SEP)
+    print()
 
 
 # ================================================================
@@ -1583,29 +1630,29 @@ def main():
     if save_path.is_file() and save_path.suffix == '.sav':
         # Extract gamestate from .sav ZIP archive to a temp directory
         if not zipfile.is_zipfile(save_path):
-            print(f"Error: {save_path} is not a valid ZIP archive")
+            print(f"{_bold_red('Error')}: {save_path} is not a valid ZIP archive")
             sys.exit(1)
         tmp_dir = tempfile.mkdtemp(prefix='stellaris_es_')
         with zipfile.ZipFile(save_path, 'r') as zf:
             if 'gamestate' not in zf.namelist():
-                print(f"Error: {save_path} does not contain a 'gamestate' file")
+                print(f"{_bold_red('Error')}: {save_path} does not contain a 'gamestate' file")
                 shutil.rmtree(tmp_dir)
                 sys.exit(1)
             zf.extract('gamestate', tmp_dir)
         gamestate = Path(tmp_dir) / 'gamestate'
-        print(f"Parsing: {save_path}  (country {country_id})")
+        print(f"📂 Parsing: {_bold(save_path)}  {_dim(f'(country {country_id})')}")
     elif save_path.is_dir():
         gamestate = save_path / 'gamestate'
         if not gamestate.exists():
-            print(f"Error: {gamestate} not found")
+            print(f"{_bold_red('Error')}: {gamestate} not found")
             sys.exit(1)
-        print(f"Parsing: {gamestate}  (country {country_id})")
+        print(f"📂 Parsing: {_bold(gamestate)}  {_dim(f'(country {country_id})')}")
     elif save_path.is_file():
         # Assume it's a gamestate file directly
         gamestate = save_path
-        print(f"Parsing: {gamestate}  (country {country_id})")
+        print(f"📂 Parsing: {_bold(gamestate)}  {_dim(f'(country {country_id})')}")
     else:
-        print(f"Error: {save_path} not found")
+        print(f"{_bold_red('Error')}: {save_path} not found")
         sys.exit(1)
 
     gs = str(gamestate)
@@ -1619,19 +1666,28 @@ def main():
 
 def _run_analysis(gs, country_id):
     """Run the full 9-pass analysis on a gamestate file path."""
-    print("Pass 1/9: species data ...")
+    _N = 9  # total passes
+
+    def _pass(n, emoji, label):
+        bar = _bold_cyan(f"[{n}/{_N}]")
+        print(f"  {bar} {emoji} {_bold(label)}")
+
+    def _result(text):
+        print(f"       {_dim('→')} {text}")
+
+    _pass(1, '🧬', 'Species data')
     species_data = extract_species_data(gs)
-    print(f"  → {len(species_data)} species loaded")
+    _result(f"{_cyan(len(species_data))} species loaded")
 
-    print("Pass 2/9: country data ...")
+    _pass(2, '🏛️', ' Country data')
     country_data = extract_country_data(gs, country_id)
-    print(f"  → {len(country_data['traditions'])} traditions, "
-          f"{len(country_data['technologies'])} techs, "
-          f"{len(country_data['ascension_perks'])} perks, "
-          f"{len(country_data['civics'])} civics, "
-          f"{len(country_data['owned_planets'])} owned planets")
+    _result(f"{_cyan(len(country_data['traditions']))} traditions, "
+            f"{_cyan(len(country_data['technologies']))} techs, "
+            f"{_cyan(len(country_data['ascension_perks']))} perks, "
+            f"{_cyan(len(country_data['civics']))} civics, "
+            f"{_bold_white(len(country_data['owned_planets']))} owned planets")
 
-    print("Pass 3/9: planet data ...")
+    _pass(3, '🪐', 'Planet data')
     planet_data = extract_planet_data(gs, country_data['owned_planets'])
     all_district_ids = []
     total_pops_by_species = defaultdict(float)
@@ -1643,12 +1699,12 @@ def _run_analysis(gs, country_id):
     asc_counts = defaultdict(int)
     for pd in planet_data.values():
         asc_counts[pd['ascension_tier']] += 1
-    asc_note = ', '.join(f"T{t}:{c}" for t, c in sorted(asc_counts.items()) if t > 0)
-    print(f"  → {len(all_district_ids)} district refs, "
-          f"{sum(total_pops_by_species.values()):.0f} pops, "
-          f"ascension: {asc_note or 'none'}")
+    asc_note = ', '.join(f"T{t}:{_magenta(c)}" for t, c in sorted(asc_counts.items()) if t > 0)
+    _result(f"{_cyan(len(all_district_ids))} district refs, "
+            f"{_bold_white(f'{sum(total_pops_by_species.values()):.0f}')} pops, "
+            f"ascension: {asc_note or _dim('none')}")
 
-    print("Pass 4/9: pop categories ...")
+    _pass(4, '👥', 'Pop categories')
     pop_category_data = extract_pop_category_data(gs, country_data['owned_planets'])
     total_triggered = sum(
         cat['triggered'] for by_sp in pop_category_data.values()
@@ -1656,24 +1712,24 @@ def _run_analysis(gs, country_id):
     total_non_triggered = sum(
         cat['non_triggered'] for by_sp in pop_category_data.values()
         for cat in by_sp.values())
-    print(f"  → {total_triggered + total_non_triggered} pops categorized "
-          f"({total_triggered} in triggered categories, "
-          f"{total_non_triggered} in excluded categories)")
+    _result(f"{_bold_white(total_triggered + total_non_triggered)} pops categorized "
+            f"({_green(total_triggered)} triggered, "
+            f"{_yellow(total_non_triggered)} excluded)")
 
-    print("Pass 5/9: district levels ...")
+    _pass(5, '🏗️', ' District levels')
     district_levels = extract_district_levels(gs, all_district_ids)
     total_district_levels = sum(district_levels.values())
     missing_districts = len(all_district_ids) - len(district_levels)
-    print(f"  → {total_district_levels} total district levels "
-          f"(from {len(district_levels)} unique IDs)")
+    _result(f"{_bold_white(total_district_levels)} total levels "
+            f"{_dim(f'(from {len(district_levels)} unique IDs)')}")
     if missing_districts:
-        print(f"  ⚠ {missing_districts} district IDs not found in districts= section")
+        _result(f"{_bold_red(f'⚠ {missing_districts}')} district IDs not found")
 
     owned_fleets = country_data.get('owned_fleets', [])
-    print(f"Pass 6/9: owned systems ({len(owned_fleets)} owned fleets) ...")
+    _pass(6, '🌌', f'Owned systems ({len(owned_fleets)} fleets)')
     total_systems, systems_total_matched, systems_excluded = count_owned_systems(gs, owned_fleets)
-    print(f"  → {total_systems} owned systems "
-          f"({systems_total_matched} matched, {systems_excluded} excluded)")
+    _result(f"{_bold_white(total_systems)} owned systems "
+            f"{_dim(f'({systems_total_matched} matched, {systems_excluded} excluded)')}")
 
     # Collect all governor leader IDs from planet data
     governor_ids = set()
@@ -1681,12 +1737,12 @@ def _run_analysis(gs, country_id):
         if pd.get('governor') is not None:
             governor_ids.add(pd['governor'])
 
-    print("Pass 7/9: leader data ...")
+    _pass(7, '👔', 'Leader data')
     leader_data = extract_leader_data(gs, governor_ids)
-    print(f"  → {len(leader_data)} leaders loaded "
-          f"(skills: {', '.join(str(ld['skill']) for ld in leader_data.values()) or 'none'})")
+    skills_str = ', '.join(_cyan(str(ld['skill'])) for ld in leader_data.values()) or _dim('none')
+    _result(f"{_bold_white(len(leader_data))} leaders (skills: {skills_str})")
 
-    print("Pass 8/9: sector data ...")
+    _pass(8, '📍', 'Sector data')
     sector_data = extract_sector_data(gs, country_id)
     # Collect sector governor IDs (from capital planets' governor field)
     for sec in sector_data.values():
@@ -1700,11 +1756,11 @@ def _run_analysis(gs, country_id):
     if missing_govs:
         extra_leaders = extract_leader_data(gs, missing_govs)
         leader_data.update(extra_leaders)
-        print(f"  → {len(sector_data)} sectors, +{len(extra_leaders)} sector governors loaded")
+        _result(f"{_cyan(len(sector_data))} sectors, +{_cyan(len(extra_leaders))} sector governors")
     else:
-        print(f"  → {len(sector_data)} sectors")
+        _result(f"{_cyan(len(sector_data))} sectors")
 
-    print("Pass 9/9: galactic objects (planet→sector map) ...")
+    _pass(9, '🗺️', ' Planet→sector map')
     planet_sector_map = build_planet_to_sector_map(gs, sector_data, planet_data)
     in_sectors = sum(1 for p in planet_sector_map.values() if p['sector_id'] is not None)
     in_frontier = sum(1 for p in planet_sector_map.values() if p['sector_id'] is None)
@@ -1713,8 +1769,8 @@ def _run_analysis(gs, country_id):
     frontier_direct = sum(1 for pid, p in planet_sector_map.items()
                           if p['sector_id'] is None
                           and planet_data[pid].get('governor') is not None)
-    print(f"  → {in_sectors} planets in sectors ({with_sec_gov} with governor), "
-          f"{in_frontier} in frontier systems ({frontier_direct} with direct governor)")
+    _result(f"{_cyan(in_sectors)} in sectors ({_green(with_sec_gov)} with governor), "
+            f"{_yellow(in_frontier)} frontier ({frontier_direct} with direct governor)")
 
     print()
     modifiers = calculate_active_modifiers(
